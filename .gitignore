@@ -1,0 +1,34 @@
+
+*.vsix
+# Compiled output
+dist/
+out/
+
+# Dependencies
+node_modules/
+
+# Package artifacts
+*.vsix
+
+# VS Code test output
+.vscode-test/
+
+# Build logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment / secrets
+.env
+.env.*
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Temp files
+*.tmp
+*.temp

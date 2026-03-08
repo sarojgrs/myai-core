@@ -1,0 +1,74 @@
+{
+  "project": {
+    "name": "myai-core",
+    "description": "A core library for AI applications",
+    "language": "typescript",
+    "stack": [
+      "typescript",
+      "node.js"
+    ],
+    "frameworks": [
+      "node-fetch"
+    ],
+    "testFramework": null,
+    "packageManager": "npm"
+  },
+  "structure": {
+    "rootFiles": [
+      "package-lock.json",
+      "package.json",
+      "tsconfig.json"
+    ],
+    "srcDir": "src",
+    "entryPoint": "src/index.ts",
+    "configFiles": [
+      "tsconfig.json"
+    ],
+    "importantFiles": [
+      {
+        "path": "src/index.ts",
+        "role": "main entry point of the application"
+      },
+      {
+        "path": "src/core/",
+        "role": "core functionality and logic"
+      },
+      {
+        "path": "src/adapters/",
+        "role": "adapters for different services and APIs"
+      },
+      {
+        "path": "src/profiles/",
+        "role": "profile configurations and settings"
+      }
+    ]
+  },
+  "ai": {
+    "alwaysInclude": [
+      "src/index.ts",
+      "src/core/",
+      "src/adapters/",
+      "src/profiles/",
+      "tsconfig.json",
+      "package.json",
+      "MYAI.md"
+    ],
+    "ignore": [
+      "node_modules",
+      "dist",
+      ".git",
+      "build",
+      "coverage"
+    ],
+    "maxSteps": 10,
+    "tokenBudget": 4000
+  },
+  "conventions": {
+    "namingStyle": "camelCase",
+    "indentStyle": "spaces",
+    "indentSize": 2,
+    "quotes": "single",
+    "semicolons": true,
+    "notes": "TypeScript configuration follows strict mode with ES2020 target"
+  }
+}

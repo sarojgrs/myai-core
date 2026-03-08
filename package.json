@@ -1,0 +1,74 @@
+{
+  "name": "@sarojgrs/myai-core",
+  "version": "0.1.0",
+  "description": "Framework-agnostic autonomous AI agent engine — works in VS Code, CLI, CI/CD, and any Node.js app",
+  "author": "Saroj",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./profiles": {
+      "require": "./dist/profiles/index.js",
+      "types": "./dist/profiles/index.d.ts"
+    },
+    "./adapters/CLIAdapter": {
+      "require": "./dist/adapters/CLIAdapter.js",
+      "types": "./dist/adapters/CLIAdapter.d.ts"
+    },
+    "./adapters/VSCodeAdapter": {
+      "require": "./dist/adapters/VSCodeAdapter.js",
+      "types": "./dist/adapters/VSCodeAdapter.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rimraf dist",
+    "rebuild": "npm run clean && npm run build",
+    "prepublishOnly": "npm run rebuild",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "coding-assistant",
+    "cli",
+    "autonomous",
+    "cerebras",
+    "groq",
+    "openai"
+  ],
+  "peerDependencies": {
+    "@types/vscode": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@types/vscode": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "rimraf": "^6.1.3",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
