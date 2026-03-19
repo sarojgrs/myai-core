@@ -144,3 +144,6 @@ export type {
   CustomProfileDefinition,
   ProviderEntry,
 } from "./factory";
+
+import * as dotenv from "dotenv";
+dotenv.config();
