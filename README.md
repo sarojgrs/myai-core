@@ -7,7 +7,7 @@
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-blue)](https://www.typescriptlang.org/)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/)
 
-`myai-core` is a **TypeScript‑first framework for building autonomous AI agents** that can plan, act, remember, and collaborate.
+`myai-core` is a **TypeScript‑first library for building autonomous AI agents** that can plan, act, remember, and collaborate.
 
 The goal is to make AI agents **easy to embed inside real applications** without heavy frameworks.
 
