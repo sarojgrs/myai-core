@@ -31,8 +31,10 @@ export abstract class BaseProfile {
   getAllowedTools(allTools?: ToolDefinition[]): ToolDefinition[] {
     const toolDefs = allTools || TOOL_DEFINITIONS;
 
+    // Profile allowed built-in tools
     const builtIn = toolDefs.filter((t) => this.allowedTools.includes(t.name));
 
+    // Tools in allowedTools but not in toolDefs
     const custom = this.allowedTools
       .filter((name) => !toolDefs.some((t) => t.name === name))
       .map(
@@ -44,7 +46,13 @@ export abstract class BaseProfile {
           }) as ToolDefinition,
       );
 
-    return [...builtIn, ...custom];
+    // User registered tools = NOT in TOOL_DEFINITIONS
+    // Always include regardless of allowedTools list!
+    const userRegisteredTools = toolDefs.filter(
+      (t) => !TOOL_DEFINITIONS.find((bt) => bt.name === t.name),
+    );
+
+    return [...builtIn, ...custom, ...userRegisteredTools];
   }
 
   /** Check if a specific tool is allowed */

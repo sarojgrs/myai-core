@@ -113,10 +113,16 @@ export class OpenAIAdapter implements ProviderAdapter {
     const msg = json.choices?.[0]?.message;
     if (!msg) throw new Error(`${cfg.name}: no message in response`);
 
+    let toolCalls = msg.tool_calls;
+
+    if (!toolCalls?.length && msg.content) {
+      toolCalls = this._extractTextToolCalls(msg.content);
+    }
+
     return {
       role: "assistant",
-      content: msg.content ?? null,
-      tool_calls: msg.tool_calls,
+      content: toolCalls?.length ? null : (msg.content ?? null),
+      tool_calls: toolCalls,
       usage: json.usage,
     };
   }
@@ -184,5 +190,43 @@ export class OpenAIAdapter implements ProviderAdapter {
         `[ProviderEngine/Tokens] prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} total=${usage.total_tokens}`,
       );
     }
+  }
+
+  private _extractTextToolCalls(
+    content: string,
+  ): ToolCallResponse["tool_calls"] | undefined {
+    const trimmed = content.trim();
+    const arrayMatch = trimmed.match(/\[[\s\S]*\]/);
+    const objectMatch = trimmed.match(/\{[\s\S]*\}/);
+    const raw = arrayMatch?.[0] ?? objectMatch?.[0];
+    if (!raw) return undefined;
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+
+    const items: any[] = Array.isArray(parsed) ? parsed : [parsed];
+
+    const calls = items
+      .filter(
+        (item) =>
+          typeof item?.name === "string" && item?.arguments !== undefined,
+      )
+      .map((item, i) => ({
+        id: `call_${Date.now()}_${i}`,
+        type: "function" as const,
+        function: {
+          name: item.name,
+          arguments:
+            typeof item.arguments === "string"
+              ? item.arguments
+              : JSON.stringify(item.arguments),
+        },
+      }));
+
+    return calls.length > 0 ? calls : undefined;
   }
 }

@@ -1,20 +1,11 @@
 /**
  *
- * CORRECTED: Comprehensive runnable examples for @saroj/myai-core
- * BASED ON ACTUAL IMPLEMENTATIONS: ToolRegistry, ErrorHandler, ExecutorCheckpoint
- *
- * ── KEY CORRECTIONS ──────────────────────────────────────────────────────────
- *1. ToolRegistry: Use registerTool() with ToolParameter interface
- *2. ErrorHandler: Proper ErrorContext + ErrorAction + custom handlers
- *3. Checkpoint: Real ExecutorCheckpoint structure with runId, turn tracking
- *4. Error handling: Proper error recovery with retry, fallback, abort, skip
- *5. LoopDetector: Detects tool loops (consecutive + cycling)
- *6. Pipeline: Multi-step execution with provider/profile overrides
- *7. Hooks: Turn-based lifecycle hooks with state tracking
- *
+ * Comprehensive runnable examples for @saroj/myai-core
+ 
+ 
  * ── EXAMPLES ──────────────────────────────────────────────────────────────────
  *1.  Basic Agent— createAgent() with onMessage
- *2.  Groq Provider — Provider switching
+ *2.  Multiple Provider switching
  *3.  Chat Mode— Stateful conversation
  *4.  Memory with Recall— MemoryEngine with strategies
  *5.  Custom Tools (ToolRegistry)— registerTool() with typed params
@@ -30,12 +21,9 @@
  *15. Tool Validation— ToolRegistry parameter validation
  *16. Custom Error Recovery— Retry + backoff + provider fallback
  *17. Real-World: Analysis → Plan → Code— Sequential workflow with memory
- *18. Provider-Specific Tools— Different tools per provider
- *19. Advanced Error Context — Full ErrorContext with messages
- *
- * ── RUNNING ───────────────────────────────────────────────────────────────────
- *npx ts-node ComprehensiveClientExamples-Corrected 1
- *npx ts-node ComprehensiveClientExamples-Corrected 0# Run all
+ *18. Advance error context
+ *19. Built in RAG tool
+ *20. Custom profiles + RAG tool
  */
 
 import * as fs from "fs";
@@ -60,8 +48,10 @@ import {
   AgentMessage,
   ProfileManager,
   ProviderEngine,
+  RAGToolkit,
 } from "../src/index";
 import { LoopDetector } from "../src/core/agent/LoopDetector";
+import { Pool } from "pg";
 
 const WORKSPACE = process.cwd();
 
@@ -120,15 +110,15 @@ async function example1_basicAgent() {
   }
 }
 
-// ── EXAMPLE 2: Multi-Provider with Groq ────────────────────────────────────
+// ── EXAMPLE 2: Multi-Provider  ────────────────────────────────────
 
-async function example2_multiProviderGroq() {
+async function example2_multiProvider() {
   console.log("\n╔══════════════════════════════════════════════════════════╗");
-  console.log("║ Example 2: Multi-Provider (Cerebras + Groq)║");
+  console.log("║ Example 2: Multi-Provider║");
   console.log("╚══════════════════════════════════════════════════════════╝");
 
   if (!process.env.CEREBRAS_API_KEY && !process.env.CODESTRAL_API_KEY) {
-    console.log("Skipping: CEREBRAS_API_KEY or GROQ_API_KEY not set");
+    console.log("Skipping: CEREBRAS_API_KEY or CODESTRAL_API_KEY not set");
     return;
   }
 
@@ -640,7 +630,7 @@ async function example7_checkpointResume() {
 
     // Simulate interrupt after 100ms
     await new Promise((resolve) => setTimeout(resolve, 100));
-    console.log("⏸️Simulating interrupt...");
+    console.log("Simulating interrupt...");
 
     // In real scenario, would call: agent.getCheckpoint(task)
     // For demo, we'll just complete the task
@@ -1376,6 +1366,168 @@ async function example18_advancedErrorContext() {
 
   console.log("\nFull diagnostic context available for error handling");
 }
+async function example19_usingRagToolKit() {
+  console.log("\n╔══════════════════════════════════════════════════════════╗");
+  console.log("║ Example 19: Using RAG Toolkit                            ║");
+  console.log("╚══════════════════════════════════════════════════════════╝");
+
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+  });
+
+  const rag = RAGToolkit.create({
+    embedding: {
+      provider: "ollama",
+      model: "bge-m3",
+      url: "http://172.27.33.69:11434",
+    },
+    vectorDb: {
+      provider: "pgvector",
+      searchFn: async (embedding, limit, threshold) => {
+        const result = await pool.query(
+          `
+    SELECT id, title,
+      1 - (embedding <=> $1::vector) as similarity
+    FROM job
+    WHERE 1 - (embedding <=> $1::vector) > $2::float
+    AND embedding IS NOT NULL
+    ORDER BY similarity DESC
+    LIMIT $3::int
+    `,
+          [`[${embedding.join(",")}]`, threshold, limit],
+        );
+        return result.rows;
+      },
+    },
+  });
+
+  if (!process.env.CODESTRAL_API_KEY) {
+    console.log("Skipping: CODESTRAL_API_KEY not set");
+    return;
+  }
+
+  const { agent } = createAgent({
+    provider: "codestral",
+    apiKey: process.env.CODESTRAL_API_KEY || "",
+    model: "codestral-latest",
+    baseUrl: "https://api.mistral.ai/v1",
+    workspaceRoot: WORKSPACE,
+    // profile: "rag"  ← auto detected! ✅
+    toolRegistry: rag.registry,
+    onMessage: (msg: AgentMessage) => {
+      if (msg.type === "agentStart") console.log(` Task: ${msg.text}`);
+      if (msg.type === "agentPlan") console.log(` Plan:\n${msg.text}`);
+      if (msg.type === "agentTool") console.log(` Tool: ${msg.text}`);
+      if (msg.type === "agentDone") console.log(` Done: ${msg.text}`);
+      if (msg.type === "agentError") console.log(` Error: ${msg.text}`);
+    },
+  });
+
+  try {
+    const result = await agent.run("Find software related jobs");
+    console.log(`\nSuccess: ${result.success ? "✓" : "✗"}`);
+    console.log(`Turns: ${result.turnsUsed}`);
+    console.log(`Tools: ${result.toolsUsed.join(", ")}`);
+    console.log(`Summary: ${result.summary}`);
+  } catch (err) {
+    console.error("Error:", (err as Error).message);
+  } finally {
+    await pool.end();
+  }
+}
+async function example20customProfileWithRagToolKit() {
+  console.log("\n╔══════════════════════════════════════════════════════════╗");
+  console.log(
+    "║ Example 20: Custom Profile with RAG Toolkit                            ║",
+  );
+  console.log("╚══════════════════════════════════════════════════════════╝");
+
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+  });
+
+  const rag = RAGToolkit.create({
+    embedding: {
+      provider: "ollama",
+      model: "bge-m3",
+      url: "http://172.27.33.69:11434",
+    },
+    vectorDb: {
+      provider: "pgvector",
+      searchFn: async (embedding, limit, threshold) => {
+        const result = await pool.query(
+          `
+    SELECT id, title,
+      1 - (embedding <=> $1::vector) as similarity
+    FROM job
+    WHERE 1 - (embedding <=> $1::vector) > $2::float
+    AND embedding IS NOT NULL
+    ORDER BY similarity DESC
+    LIMIT $3::int
+    `,
+          [`[${embedding.join(",")}]`, threshold, limit],
+        );
+        return result.rows;
+      },
+    },
+  });
+
+  if (!process.env.CEREBRAS_API_KEY) {
+    console.log("Skipping: CEREBRAS_API_KEY not set");
+    return;
+  }
+
+  const { agent } = createAgent({
+    provider: "groq",
+    apiKey: process.env.GROQ_API_KEY || "",
+    model: "llama-3.1-8b-instant",
+    baseUrl: "https://api.groq.com/openai/v1",
+
+    workspaceRoot: WORKSPACE,
+
+    // Custom profile!
+    profile: "jobSearch",
+    customProfiles: {
+      jobSearch: {
+        systemPrompt:
+          "You are a job search assistant. " +
+          "You have ONE tool available: vectorSearch. " +
+          "ALWAYS respond with ONLY this exact JSON format: " +
+          '[{"tool":"vectorSearch","args":{"query":"YOUR QUERY HERE"}}]' +
+          "NOTHING else. No code. No explanation. Just JSON.",
+        planningPrompt:
+          "Respond with ONLY this JSON: " +
+          '[{"tool":"vectorSearch","args":{"query":"<user query>"}}]',
+        allowedTools: ["vectorSearch", "done"],
+        safetyRules: [
+          "Always respond with JSON array only",
+          "Never write code",
+          "Never explain",
+        ],
+      },
+    },
+    toolRegistry: rag.registry,
+    onMessage: (msg: AgentMessage) => {
+      if (msg.type === "agentStart") console.log(` Task: ${msg.text}`);
+      if (msg.type === "agentPlan") console.log(` Plan:\n${msg.text}`);
+      if (msg.type === "agentTool") console.log(` Tool: ${msg.text}`);
+      if (msg.type === "agentDone") console.log(` Done: ${msg.text}`);
+      if (msg.type === "agentError") console.log(` Error: ${msg.text}`);
+    },
+  });
+
+  try {
+    const result = await agent.run("Find software related jobs");
+    console.log(`\nSuccess: ${result.success ? "✓" : "✗"}`);
+    console.log(`Turns: ${result.turnsUsed}`);
+    console.log(`Tools: ${result.toolsUsed.join(", ")}`);
+    console.log(`Summary: ${result.summary}`);
+  } catch (err) {
+    console.error("Error:", (err as Error).message);
+  } finally {
+    await pool.end();
+  }
+}
 
 // ── MAIN ENTRY POINT ────────────────────────────────────────────────────────
 
@@ -1390,7 +1542,7 @@ async function example18_advancedErrorContext() {
 
 const EXAMPLES = [
   { num: 1, name: "Basic Agent", fn: example1_basicAgent },
-  { num: 2, name: "Multi-Provider (Groq)", fn: example2_multiProviderGroq },
+  { num: 2, name: "Multi-Provider", fn: example2_multiProvider },
   { num: 3, name: "Chat Mode", fn: example3_chatMode },
   { num: 4, name: "Memory with Recall", fn: example4_memoryWithRecall },
   { num: 5, name: "Custom Tools", fn: example5_customToolsToolRegistry },
@@ -1407,6 +1559,8 @@ const EXAMPLES = [
   { num: 16, name: "Error Recovery", fn: example16_customErrorRecovery },
   { num: 17, name: "Real-World Workflow", fn: example17_realWorldWorkflow },
   { num: 18, name: "Error Context", fn: example18_advancedErrorContext },
+  { num: 19, name: "Rag Toolkit", fn: example19_usingRagToolKit },
+  { num: 20, name: "Rag Toolkit", fn: example20customProfileWithRagToolKit },
 ];
 
 async function main() {
@@ -1419,7 +1573,7 @@ async function main() {
   EXAMPLES.forEach((ex) => console.log(`${ex.num}. ${ex.name}`));
   console.log("0. Run all");
 
-  const exampleNum = process.argv[2] ? parseInt(process.argv[2]) : 5;
+  const exampleNum = process.argv[2] ? parseInt(process.argv[2]) : 1;
 
   if (exampleNum === 0) {
     for (const ex of EXAMPLES) {

@@ -27,6 +27,7 @@ import { ResearchProfile } from "./profiles/Research";
 import { SupportProfile } from "./profiles/Support";
 import { AutomationProfile } from "./profiles/Automation";
 import { BaseProfile } from "./profiles/Base";
+import { RAGProfile } from "./profiles/RAG";
 
 export type BuiltInProfile =
   | "code"
@@ -70,6 +71,7 @@ export class ProfileManager {
 
   constructor() {
     // Register all built-in profiles
+    this.register(new RAGProfile());
     this.register(new CodeProfile());
     this.register(new DevOpsProfile());
     this.register(new GeneralProfile());

@@ -449,6 +449,27 @@ export class Executor {
         const toolName = func.name;
         const toolArgs = JSON.parse(func.arguments || "{}");
 
+        /**
+         * Intercept "done" before it reaches executeToolFn.
+         * Some models (e.g. Cerebras) emit "done" as a native tool call
+         * instead of stopping naturally. Treating it as a termination signal
+         * here saves a round-trip and surfaces the last tool result as the
+         * final summary.
+         */
+        if (toolName === "done") {
+          return this._handleDone(
+            toolArgs,
+            agentMessages,
+            task,
+            toolsUsed,
+            turn,
+            filesChanged,
+            totalTokens,
+            runId,
+            onMessage,
+          );
+        }
+
         if (this.loopDetector.detectToolLoop(toolName, toolArgs)) {
           onMessage({
             type: "agentTool",
@@ -748,6 +769,25 @@ export class Executor {
       const raw = response.content;
       const toolCalls = this._parseAllToolCalls(raw);
 
+      // If the only action is "done", treat it as termination
+      if (toolCalls.length > 0 && toolCalls.every((tc) => tc.tool === "done")) {
+        const doneArgs = toolCalls[0].args as any;
+        const summary = doneArgs.summary ?? doneArgs.message ?? "";
+        const clean = summary
+          ? this._cleanDoneMessage(summary)
+          : this._cleanDoneMessage(raw);
+        onMessage({ type: "agentDone", text: clean });
+        return {
+          success: true,
+          summary: this._buildSummary(task, clean, toolsUsed, turn),
+          toolsUsed,
+          turnsUsed: turn,
+          filesChanged,
+          tokensUsed: totalTokens,
+          runId,
+        };
+      }
+
       if (toolCalls.length === 0) {
         const clean = this._cleanDoneMessage(raw);
         onMessage({ type: "agentDone", text: `${clean}` });
@@ -765,21 +805,26 @@ export class Executor {
       agentMessages.push({ role: "assistant", content: raw });
 
       for (const { tool, args } of toolCalls) {
-        if (this.loopDetector.detectToolLoop(tool, args)) {
-          onMessage({
-            type: "agentTool",
-            text: `🔄 Loop detected: ${tool} called repeatedly. Stopping.`,
-          });
-          return {
-            success: false,
-            summary: `Agent stopped — detected tool loop on ${tool}`,
+        // ── done is a termination signal, not an executable tool ────────────────
+        /**
+         * Intercept "done" before it reaches executeToolFn.
+         * Some models (e.g. Cerebras) emit "done" as a native tool call
+         * instead of stopping naturally. Treating it as a termination signal
+         * here saves a round-trip and surfaces the last tool result as the
+         * final summary.
+         */
+        if (tool === "done") {
+          return this._handleDone(
+            args,
+            agentMessages,
+            task,
             toolsUsed,
-            turnsUsed: turn,
+            turn,
             filesChanged,
-            tokensUsed: totalTokens,
-            error: "Tool loop detected",
+            totalTokens,
             runId,
-          };
+            onMessage,
+          );
         }
 
         // tool will be filtered via afterToolExecution if needed
@@ -1070,6 +1115,27 @@ export class Executor {
         const { id, function: func } = toolCall;
         const toolName = func.name;
         const toolArgs = JSON.parse(func.arguments || "{}");
+
+        /**
+         * Intercept "done" before it reaches executeToolFn.
+         * Some models (e.g. Cerebras) emit "done" as a native tool call
+         * instead of stopping naturally. Treating it as a termination signal
+         * here saves a round-trip and surfaces the last tool result as the
+         * final summary.
+         */
+        if (toolName === "done") {
+          return this._handleDone(
+            toolArgs,
+            agentMessages,
+            task,
+            toolsUsed,
+            turn,
+            filesChanged,
+            totalTokens,
+            cp.runId,
+            onMessage,
+          );
+        }
 
         // ── Loop detection — mirrors _runNative ──────────────────────────
         if (this.loopDetector.detectToolLoop(toolName, toolArgs)) {
@@ -1641,10 +1707,25 @@ export class Executor {
       try {
         const parsed = JSON.parse(arrayMatch[0]);
         if (Array.isArray(parsed)) {
+          // existing {tool, args} format
           const calls = parsed
             .filter((item: any) => typeof item?.tool === "string")
             .map((item: any) => ({ tool: item.tool, args: item.args ?? {} }));
           if (calls.length > 0) return calls;
+
+          const calls2 = parsed
+            .filter(
+              (item: any) =>
+                typeof item?.name === "string" && item?.arguments !== undefined,
+            )
+            .map((item: any) => ({
+              tool: item.name,
+              args:
+                typeof item.arguments === "string"
+                  ? JSON.parse(item.arguments)
+                  : (item.arguments ?? {}),
+            }));
+          if (calls2.length > 0) return calls2;
         }
       } catch {}
     }
@@ -1653,8 +1734,26 @@ export class Executor {
     if (objectMatch) {
       try {
         const parsed = JSON.parse(objectMatch[0]);
+
+        // Standard prompt-injection format: {"tool":"name","args":{...}}
+        // Used by most models following the framework's tool prompt template
         if (typeof parsed?.tool === "string") {
           return [{ tool: parsed.tool, args: parsed.args ?? {} }];
+        }
+
+        // OpenAI native tool-call format leaked into text: {"name":"name","arguments":{...}}
+        // Some models (e.g. Cerebras) ignore tool_choice and emit this format
+        // in content instead of tool_calls. Normalise it to {tool, args} so
+        // the rest of the prompt path handles it identically.
+        if (
+          typeof parsed?.name === "string" &&
+          parsed?.arguments !== undefined
+        ) {
+          const args =
+            typeof parsed.arguments === "string"
+              ? JSON.parse(parsed.arguments)
+              : parsed.arguments;
+          return [{ tool: parsed.name, args }];
         }
       } catch {}
     }
@@ -1721,5 +1820,65 @@ export class Executor {
       i = end !== -1 ? end + 1 : raw.length;
     }
     return results;
+  }
+
+  /**
+   * Shared termination handler for native tool-call mode.
+   * Called when the model emits a "done" tool call in either
+   * _runNative or executeFromCheckpoint.
+   *
+   * Extracts a human-readable summary from the tool args if present,
+   * otherwise falls back to the last tool result in agentMessages.
+   * Emits agentDone and returns a successful AgentResult immediately,
+   * bypassing executeToolFn entirely.
+   */
+  private _handleDone(
+    toolArgs: Record<string, any>,
+    agentMessages: any[],
+    task: string,
+    toolsUsed: string[],
+    turn: number,
+    filesChanged: string[],
+    totalTokens: number,
+    runId: string,
+    onMessage: (msg: any) => void,
+  ): AgentResult {
+    const summary =
+      toolArgs.summary ??
+      toolArgs.message ??
+      toolArgs.result ??
+      toolArgs.text ??
+      toolArgs.output ??
+      "";
+    const clean = summary
+      ? this._cleanDoneMessage(String(summary))
+      : this._cleanDoneMessage(
+          (() => {
+            for (let i = agentMessages.length - 1; i >= 0; i--) {
+              const m = agentMessages[i];
+              // native path: role === "tool"
+              // prompt path: role === "user" with "Tool result [" prefix
+              if (
+                m?.role === "tool" ||
+                (m?.role === "user" &&
+                  typeof m?.content === "string" &&
+                  m.content.startsWith("Tool result ["))
+              ) {
+                return m.content;
+              }
+            }
+            return "Task complete.";
+          })(),
+        );
+    onMessage({ type: "agentDone", text: clean });
+    return {
+      success: true,
+      summary: this._buildSummary(task, clean, toolsUsed, turn),
+      toolsUsed,
+      turnsUsed: turn,
+      filesChanged,
+      tokensUsed: totalTokens,
+      runId,
+    };
   }
 }

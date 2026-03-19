@@ -145,5 +145,14 @@ export type {
   ProviderEntry,
 } from "./factory";
 
+// RAG
+export { RAGToolkit } from "./rag/RAGToolkit";
+export type {
+  RAGConfig,
+  EmbeddingConfig,
+  VectorDbConfig,
+  RAGSearchResult,
+} from "./rag/types";
+
 import * as dotenv from "dotenv";
 dotenv.config();

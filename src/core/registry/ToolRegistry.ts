@@ -74,7 +74,14 @@ export interface EnhancedToolDefinition {
   params: Record<string, ToolParameter>;
 
   /** Tool category for organization */
-  category?: "builtin" | "file" | "git" | "shell" | "integration" | "custom";
+  category?:
+    | "builtin"
+    | "file"
+    | "git"
+    | "shell"
+    | "integration"
+    | "custom"
+    | "rag";
 
   /** Tool version */
   version?: string;

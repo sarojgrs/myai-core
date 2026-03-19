@@ -8,7 +8,11 @@ import {
   AgentMessage,
 } from "./core/AgentEngine";
 import { ChatEngine } from "./core/ChatEngine";
-import { ToolEngine, buildToolSystemPrompt } from "./core/ToolEngine";
+import {
+  ToolEngine,
+  ToolParameter,
+  buildToolSystemPrompt,
+} from "./core/ToolEngine";
 import {
   ProviderEngine,
   ProviderConfig,
@@ -291,7 +295,7 @@ function buildAgentInternals(options: CreateAgentOptions): AgentInternals {
         agentConfig.signal,
       ),
 
-    executeTool: (tool, args, msgFn, cfg) => {
+    executeTool: async (tool, args, msgFn, cfg) => {
       if (!profileManager.isToolAllowed(tool) && tool !== "done") {
         return Promise.resolve({
           tool,
@@ -299,14 +303,19 @@ function buildAgentInternals(options: CreateAgentOptions): AgentInternals {
           output: `Tool "${tool}" not allowed in profile "${profileManager.getActiveName()}". Allowed: ${profileManager.getAllowedTools().join(", ")}`,
         });
       }
-      return toolEngine.execute(tool, args, msgFn, cfg);
+      const result = await toolEngine.execute(tool, args, msgFn, cfg);
+      return result;
     },
 
     buildToolSchemas: () =>
-      providerEngine.buildNativeSchemas(profileManager.getAllowedTools()),
+      providerEngine.buildNativeSchemas(
+        profileManager.getAllowedTools(toolEngine.getAllDefinitions()), // toolDefs = built-in + custom + userRegisteredTools found!
+      ),
 
     buildToolPrompt: () =>
-      buildToolSystemPrompt(profileManager.getAllowedTools()),
+      buildToolSystemPrompt(
+        profileManager.getAllowedTools(toolEngine.getAllDefinitions()), // toolDefs = built-in + custom + userRegisteredTools found!
+      ),
 
     profileSystemPrompt: () => profileManager.buildSystemPrompt(),
     profilePlanningPrompt: () => profileManager.getPlanningPrompt(),
@@ -339,16 +348,25 @@ export interface CreateAgentResult {
 
 export function createAgent(options: CreateAgentOptions): CreateAgentResult {
   const controller = new AbortController();
+
+  const resolvedOptions = { ...options };
+
+  // Auto-select "rag" profile if:
+  // 1. toolRegistry is passed
+  // 2. no profile specified
+  // Regardless of which tools are registered!
+  if (options.toolRegistry && !options.profile) {
+    resolvedOptions.profile = "rag"; // any toolRegistry!
+  }
+
   const { agentConfig, deps, providerEngine, profileManager, toolEngine } =
     buildAgentInternals({
-      ...options,
+      ...resolvedOptions,
       signal: controller.signal,
     });
 
   const agent = new AgentEngine(agentConfig, deps);
 
-  // Wire hooks at creation time if provided.
-  // Can also be called later via agent.setHooks() — later call replaces earlier.
   if (options.hooks) {
     agent.setHooks(options.hooks);
   }
@@ -395,12 +413,8 @@ function attachRegistryTools(
       {
         name: def.name,
         description: def.description,
-        params: Object.fromEntries(
-          Object.entries(def.params).map(([key, p]) => [
-            key,
-            `${p.type} — ${p.description}`,
-          ]),
-        ),
+        params: def.params as Record<string, string | ToolParameter>, //   pass params as-is!
+        // ToolEngine now supports ToolParameter
       },
       async (args, cfg) => {
         registry.validateArguments(def.name, args);
@@ -409,7 +423,7 @@ function attachRegistryTools(
           return {
             tool: def.name,
             success: false,
-            output: `No handler registered for tool "${def.name}"`,
+            output: `No handler for "${def.name}"`,
           };
         }
         return handler(args, cfg);
