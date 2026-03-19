@@ -19,10 +19,21 @@ export interface ToolResult {
   output: string;
 }
 
+export interface ToolParameter {
+  type: "string" | "number" | "boolean";
+  description: string;
+  required?: boolean;
+  default?: any;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  enum?: string[];
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
-  params: Record<string, string>;
+  params: Record<string, string | ToolParameter>;
 }
 
 // ── Built-in tool definitions ─────────────────────────────────────────────────
@@ -388,7 +399,22 @@ export class ToolEngine {
     // Custom tools go through the same allowlist gate as built-in tools.
     // The caller (AgentEngine executeToolFn) already checks isToolAllowed — this
     // is a defence-in-depth check so execute() is safe to call directly too.
+    // Custom tools with auto-validation!
     if (this.customTools.has(tool)) {
+      const definition = this.customToolDefinitions.get(tool);
+      if (definition) {
+        try {
+          this.validateToolArgs(tool, args, definition);
+        } catch (err: any) {
+          // Return validation error as tool result
+          // so agent can self-correct!
+          return {
+            tool,
+            success: false,
+            output: `Validation error: ${err.message}`,
+          };
+        }
+      }
       return this.customTools.get(tool)!(args, config);
     }
 
@@ -702,6 +728,84 @@ export class ToolEngine {
 
       default:
         return { tool, success: false, output: `Unknown tool: ${tool}` };
+    }
+  }
+
+  private validateToolArgs(
+    toolName: string,
+    args: Record<string, string>,
+    definition: ToolDefinition,
+  ): void {
+    const params = definition.params;
+
+    for (const [paramName, paramDef] of Object.entries(params)) {
+      // Skip if param is just a string description
+      // (old format in built-in tools)
+      if (typeof paramDef === "string") continue;
+
+      const value = args[paramName];
+      const param = paramDef as ToolParameter;
+
+      // Check required
+      if (
+        param.required &&
+        (value === undefined || value === null || value === "")
+      ) {
+        throw new Error(
+          `Tool '${toolName}': required param '${paramName}' is missing`,
+        );
+      }
+
+      // Skip further checks if not provided and not required
+      if (value === undefined || value === null) continue;
+
+      // Check type
+      if (param.type === "number" && isNaN(Number(value))) {
+        throw new Error(
+          `Tool '${toolName}': param '${paramName}' must be a number`,
+        );
+      }
+
+      if (param.type === "boolean" && value !== "true" && value !== "false") {
+        throw new Error(
+          `Tool '${toolName}': param '${paramName}' must be true or false`,
+        );
+      }
+
+      // Check enum
+      if (param.enum && !param.enum.includes(value)) {
+        throw new Error(
+          `Tool '${toolName}': param '${paramName}' must be ` +
+            `one of: ${param.enum.join(", ")}`,
+        );
+      }
+
+      // Check minLength
+      if (param.minLength && value.length < param.minLength) {
+        throw new Error(
+          `Tool '${toolName}': param '${paramName}' must be ` +
+            `at least ${param.minLength} characters`,
+        );
+      }
+
+      // Check maxLength
+      if (param.maxLength && value.length > param.maxLength) {
+        throw new Error(
+          `Tool '${toolName}': param '${paramName}' must be ` +
+            `at most ${param.maxLength} characters`,
+        );
+      }
+
+      // Check pattern
+      if (param.pattern) {
+        const regex = new RegExp(param.pattern);
+        if (!regex.test(value)) {
+          throw new Error(
+            `Tool '${toolName}': param '${paramName}' ` +
+              `does not match required pattern`,
+          );
+        }
+      }
     }
   }
 }

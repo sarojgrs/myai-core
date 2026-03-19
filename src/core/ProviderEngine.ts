@@ -282,14 +282,35 @@ export class ProviderEngine {
 
   buildNativeSchemas(tools: ToolDefinition[]): NativeTool[] {
     return tools.map((t) => {
-      const properties: Record<string, { type: string; description: string }> =
-        {};
+      const properties: Record<
+        string,
+        {
+          type: string;
+          description: string;
+          enum?: string[];
+        }
+      > = {};
       const required: string[] = [];
 
       for (const [key, desc] of Object.entries(t.params)) {
-        const optional = desc.includes("optional");
-        properties[key] = { type: "string", description: desc };
-        if (!optional) required.push(key);
+        // Old format → string description
+        if (typeof desc === "string") {
+          const optional = desc.includes("optional");
+          properties[key] = {
+            type: "string",
+            description: desc,
+          };
+          if (!optional) required.push(key);
+
+          // New format → ToolParameter object
+        } else {
+          properties[key] = {
+            type: desc.type || "string",
+            description: desc.description,
+            ...(desc.enum ? { enum: desc.enum } : {}),
+          };
+          if (desc.required) required.push(key);
+        }
       }
 
       return {
@@ -297,7 +318,11 @@ export class ProviderEngine {
         function: {
           name: t.name,
           description: t.description,
-          parameters: { type: "object", properties, required },
+          parameters: {
+            type: "object",
+            properties,
+            required,
+          },
         },
       };
     });

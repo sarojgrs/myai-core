@@ -279,7 +279,7 @@ async function example4_memoryWithRecall() {
 
 async function example5_customToolsToolRegistry() {
   console.log("\n╔══════════════════════════════════════════════════════════╗");
-  console.log("║ Example 5: ToolRegistry (Custom Tool Registration) ║");
+  console.log("║ Example 5: ToolRegistry + Auto Validation                ║");
   console.log("╚══════════════════════════════════════════════════════════╝");
 
   if (!process.env.CEREBRAS_API_KEY) {
@@ -287,10 +287,9 @@ async function example5_customToolsToolRegistry() {
     return;
   }
 
-  // Initialize ToolRegistry
   const toolRegistry = new ToolRegistry();
 
-  // Example: Register chat.send() tool
+  // Register chatSend tool
   toolRegistry.registerTool(
     "chatSend",
     {
@@ -326,7 +325,6 @@ async function example5_customToolsToolRegistry() {
     },
     async (args, config) => {
       console.log(` [chatSend] Sending to ${args.channel}: "${args.message}"`);
-      // Mock implementation
       return {
         tool: "chatSend",
         success: true,
@@ -335,11 +333,14 @@ async function example5_customToolsToolRegistry() {
     },
   );
 
-  // Register another tool: HTTP request
+  // Register httpRequest tool
   toolRegistry.registerTool(
     "httpRequest",
     {
-      description: "Make HTTP API request",
+      description:
+        "Use this tool to make ANY HTTP API requests. " +
+        "Always prefer this over curl or runCommand " +
+        "for all HTTP calls including GET, POST, PUT, DELETE.",
       category: "integration",
       tags: ["api", "http"],
       params: {
@@ -372,6 +373,85 @@ async function example5_customToolsToolRegistry() {
     },
   );
 
+  // ── Test auto-validation directly ──────────────────────────────
+
+  console.log("\n Testing Auto-Validation:\n");
+
+  // Test 1: Valid args → should pass
+  console.log("[1] Valid chatSend args:");
+  try {
+    toolRegistry.validateArguments("chatSend", {
+      channel: "#general",
+      message: "Hello team",
+    });
+    console.log("Passed\n");
+  } catch (err) {
+    console.log(`Failed: ${(err as Error).message}\n`);
+  }
+
+  // Test 2: Missing required field → should fail
+  console.log("[2] Missing required 'channel':");
+  try {
+    toolRegistry.validateArguments("chatSend", {
+      message: "Hello team",
+    });
+    console.log("Passed\n");
+  } catch (err) {
+    console.log(`Caught: ${(err as Error).message}\n`);
+  }
+
+  // Test 3: Invalid pattern → should fail
+  console.log("[3] Invalid channel pattern (no # prefix):");
+  try {
+    toolRegistry.validateArguments("chatSend", {
+      channel: "general", // ← missing # !
+      message: "Hello",
+    });
+    console.log("Passed\n");
+  } catch (err) {
+    console.log(`Caught: ${(err as Error).message}\n`);
+  }
+
+  // Test 4: Invalid enum → should fail
+  console.log("[4] Invalid HTTP method enum:");
+  try {
+    toolRegistry.validateArguments("httpRequest", {
+      method: "PATCH", // ← not in enum!
+      url: "https://api.example.com",
+    });
+    console.log("Passed\n");
+  } catch (err) {
+    console.log(`Caught: ${(err as Error).message}\n`);
+  }
+
+  // Test 5: Invalid URL pattern → should fail
+  console.log("[5] Invalid URL pattern:");
+  try {
+    toolRegistry.validateArguments("httpRequest", {
+      method: "GET",
+      url: "not-a-url", // ← no https://
+    });
+    console.log("Passed\n");
+  } catch (err) {
+    console.log(`Caught: ${(err as Error).message}\n`);
+  }
+
+  // Test 6: Message too long → should fail
+  console.log("[6] Message exceeds maxLength:");
+  try {
+    toolRegistry.validateArguments("chatSend", {
+      channel: "#general",
+      message: "x".repeat(2001), // ← exceeds 2000!
+    });
+    console.log("Passed\n");
+  } catch (err) {
+    console.log(`Caught: ${(err as Error).message}\n`);
+  }
+
+  // ── NEW: Test agent auto-corrects on invalid tool call ──────────────
+
+  console.log("\nTesting Agent Auto-Correction:\n");
+
   const { agent, abort } = createAgent({
     provider: "codestral",
     apiKey: process.env.CODESTRAL_API_KEY || "",
@@ -381,21 +461,32 @@ async function example5_customToolsToolRegistry() {
     profile: "general",
     toolRegistry,
     onMessage: (msg: AgentMessage) => {
-      if (msg.type === "agentTool") console.log(` ${msg.text}`);
+      if (msg.type === "agentTool") console.log(` Tool: ${msg.text}`);
+      if (msg.type === "agentError") console.log(` Error: ${msg.text}`);
+      if (msg.type === "agentPlan") console.log(` Plan: ${msg.text}`);
     },
   });
 
   try {
-    console.log("🔨 Registered tools:");
+    console.log("Registered tools:");
     toolRegistry.getAllDefinitions().forEach((tool) => {
-      console.log(`• ${tool.name}: ${tool.description}`);
+      console.log(`  • ${tool.name}: ${tool.description}`);
     });
 
-    console.log("\n📤 Task using custom tools:");
-    const result = await agent.run(
-      "Send a message to #general saying 'Hello team' and make an API request",
+    console.log("\nTask 1: Valid request");
+    const r1 = await agent.run(
+      "Send a message to #general saying 'Hello team'",
     );
-    console.log(`Result: ${result.success ? "✓" : "✗"}`);
+    console.log(`Result: ${r1.success ? "✓" : "✗"}\n`);
+
+    console.log("Task 2: Agent must self-correct");
+    // Agent might try wrong method first
+    // validation catches it,  agent retries
+    const r2 = await agent.run(
+      "Use the httpRequest tool to make a GET request " +
+        "to https://api.example.com/users",
+    );
+    console.log(`Result: ${r2.success ? "✓" : "✗"}\n`);
   } catch (err) {
     console.error("Error:", (err as Error).message);
   } finally {
@@ -1328,7 +1419,7 @@ async function main() {
   EXAMPLES.forEach((ex) => console.log(`${ex.num}. ${ex.name}`));
   console.log("0. Run all");
 
-  const exampleNum = process.argv[2] ? parseInt(process.argv[2]) : 1;
+  const exampleNum = process.argv[2] ? parseInt(process.argv[2]) : 5;
 
   if (exampleNum === 0) {
     for (const ex of EXAMPLES) {
