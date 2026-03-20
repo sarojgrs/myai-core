@@ -2,6 +2,23 @@
  * Execution logic for agent tasks
  */
 
+/**
+ * Execution logic for agent tasks
+ *
+ * Architecture:
+ *   execute()                    → entry point, validates deps, routes to native or prompt
+ *   _runNative(ctx)              → fresh native run:  builds messages, calls _runLoop("native")
+ *   _runPrompt(ctx)              → fresh prompt run:  builds messages, calls _runLoop("prompt")
+ *   executeFromCheckpoint()      → resumed native run: restores state,  calls _runLoop("native")
+ *   executeFromCheckpointPrompt()→ resumed prompt run: restores state,  calls _runLoop("prompt")
+ *
+ *   _runLoop()                   → shared turn loop — the single source of truth for all
+ *                                  execution logic: hooks, tool dispatch, checkpointing, pruning.
+ *                                  The only difference between native and prompt is how the AI
+ *                                  is called and how tool calls are parsed — everything else
+ *                                  is identical and lives here exactly once.
+ */
+
 import {
   AgentConfig,
   AgentResult,
@@ -57,6 +74,32 @@ export interface ExecutorCheckpoint {
   // unique runId prevents same-task concurrent runs from
   // overwriting each other's checkpoints.
   runId: string;
+}
+
+// ── Internal context passed to _runLoop ───────────────────────────────────────
+
+interface RunLoopContext {
+  /** "native" uses callAIWithToolsFn + tool_calls array.
+   *  "prompt" uses callAIFn + _parseAllToolCalls on content string. */
+  mode: "native" | "prompt";
+  /** Pre-built message array — system + user + optional plan messages. */
+  agentMessages: any[];
+  /** Turn to start from. Fresh runs start at 1, resumes start at cp.turn+1. */
+  startTurn: number;
+  /** Run identifier — fresh runs generate a new one, resumes use cp.runId. */
+  runId: string;
+  /** Index of the last immutable header message (system + user + plan). */
+  fixedHeader: number;
+  /** TTL map restored from checkpoint on resume, empty for fresh runs. */
+  expiryMap: Map<number, number>;
+  /** Native tool schemas — only used when mode="native". */
+  schemas?: any[];
+  /** Cumulative tokens at loop start — 0 for fresh, cp.tokensUsed for resume. */
+  initialTokens: number;
+  /** Last prompt token count for delta tracking — 0 for fresh or prompt mode. */
+  initialLastInputTokens: number;
+  /** Full executor context (task, plan, provider, hooks, cfg, etc.). */
+  ctx: ExecutorContext;
 }
 
 export class Executor {
@@ -125,6 +168,8 @@ export class Executor {
     this.errorHandler = handler;
   }
 
+  // ── Checkpoint store ──────────────────────────────────────────────────────
+
   private checkpointStore: Map<string, ExecutorCheckpoint> = new Map();
 
   saveCheckpoint(cp: ExecutorCheckpoint): void {
@@ -186,6 +231,8 @@ export class Executor {
     this.checkpointStore.delete(`${task}:${runId}`);
   }
 
+  // ── execute() — entry point ───────────────────────────────────────────────
+
   async execute(ctx: ExecutorContext): Promise<AgentResult> {
     const { nativeTools } = ctx;
 
@@ -222,9 +269,9 @@ export class Executor {
     }
   }
 
+  // ── _runNative() — fresh native run ──────────────────────────────────────
+
   private async _runNative(ctx: ExecutorContext): Promise<AgentResult> {
-    let lastInputTokens = 0;
-    let totalTokens = 0;
     const {
       task,
       plan,
@@ -232,16 +279,10 @@ export class Executor {
       projectContext,
       toolsUsed,
       config: cfg,
-      hooks,
-      tokenBudget,
     } = ctx;
-    const { onMessage, memory } = cfg;
-    const schemas = this.buildToolSchemasForProvider!(provider);
-    const filesChanged: string[] = [];
 
-    // unique runId per run() invocation prevents checkpoint key collisions
-    // when the same task is run concurrently or back-to-back.
     const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+    const schemas = this.buildToolSchemasForProvider!(provider);
 
     const agentMessages: any[] = [
       {
@@ -265,13 +306,154 @@ export class Executor {
       });
     }
 
-    // compute fixedHeader at run start and carry it into every
-    // checkpoint so executeFromCheckpoint() uses the real value, not a
-    // hardcoded guess of 4.
-    const fixedHeader = agentMessages.length;
-    const expiryMap = new Map<number, number>();
-    for (let turn = 1; turn <= this.maxTurns; turn++) {
-      // ── Abort check — checked at the start of every turn ─────────────────
+    return this._runLoop({
+      mode: "native",
+      agentMessages,
+      startTurn: 1,
+      runId,
+      fixedHeader: agentMessages.length,
+      expiryMap: new Map(),
+      schemas,
+      initialTokens: 0,
+      initialLastInputTokens: 0,
+      ctx,
+    });
+  }
+
+  // ── _runPrompt() — fresh prompt run ──────────────────────────────────────
+
+  private async _runPrompt(ctx: ExecutorContext): Promise<AgentResult> {
+    const { task, plan, projectContext, toolsUsed, config: cfg } = ctx;
+
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+
+    const agentMessages: Message[] = [
+      {
+        role: "system",
+        content:
+          this._resolveSystemPrompt(projectContext, cfg) +
+          "\n\n" +
+          (this.buildToolPromptFn ? this.buildToolPromptFn() : ""),
+      },
+      {
+        role: "user",
+        content: `${cfg.userPrompt ? cfg.userPrompt + "\n\n" : ""}Task: ${task}`,
+      },
+    ];
+
+    if (plan.trim()) {
+      agentMessages.push({
+        role: "assistant",
+        content: `Here is my plan:\n${plan.trim()}`,
+      });
+      agentMessages.push({
+        role: "user",
+        content: "Good. Now execute the plan step by step using your tools.",
+      });
+    }
+
+    return this._runLoop({
+      mode: "prompt",
+      agentMessages,
+      startTurn: 1,
+      runId,
+      fixedHeader: agentMessages.length,
+      expiryMap: new Map(),
+      initialTokens: 0,
+      initialLastInputTokens: 0,
+      ctx,
+    });
+  }
+
+  // ── executeFromCheckpoint() — resume native run ───────────────────────────
+
+  async executeFromCheckpoint(
+    cp: ExecutorCheckpoint,
+    // Accept full ExecutorContext so hooks, tokenBudget, and provider
+    // override all flow in exactly as they do for a fresh _runNative run.
+    ctx: ExecutorContext,
+  ): Promise<AgentResult> {
+    const { provider } = ctx;
+    const schemas = this.buildToolSchemasForProvider!(provider);
+
+    return this._runLoop({
+      mode: "native",
+      agentMessages: [...cp.messages],
+      startTurn: cp.turn + 1,
+      runId: cp.runId,
+      // restore the real fixedHeader saved at run start instead of
+      // using a hardcoded guess of 4. An incorrect fixedHeader causes
+      // _pruneMessages to discard system/user messages.
+      fixedHeader: cp.fixedHeader,
+      // restore expiryMap from checkpoint so _pruneMessages correctly
+      // expires old tool results.
+      expiryMap: new Map(cp.expiryMap),
+      schemas,
+      initialTokens: cp.tokensUsed,
+      initialLastInputTokens: cp.lastInputTokens,
+      ctx,
+    });
+  }
+
+  // ── executeFromCheckpointPrompt() — resume prompt run ─────────────────────
+
+  async executeFromCheckpointPrompt(
+    cp: ExecutorCheckpoint,
+    // Accept full ExecutorContext so hooks, tokenBudget, and provider
+    // override all flow in exactly as they do for a fresh _runPrompt run.
+    ctx: ExecutorContext,
+  ): Promise<AgentResult> {
+    return this._runLoop({
+      mode: "prompt",
+      agentMessages: [...cp.messages],
+      startTurn: cp.turn + 1,
+      runId: cp.runId,
+      fixedHeader: cp.fixedHeader,
+      expiryMap: new Map(cp.expiryMap),
+      initialTokens: cp.tokensUsed,
+      initialLastInputTokens: 0, // prompt mode doesn't track input tokens separately
+      ctx,
+    });
+  }
+
+  // ── _runLoop() — shared turn loop ────────────────────────────────────────
+  //
+  // Single source of truth for all execution logic.
+  // Called by all 4 public paths with mode + pre-built state.
+  // The only difference between "native" and "prompt":
+  //   native → callAIWithToolsFn + response.tool_calls
+  //   prompt → callAIFn          + _parseAllToolCalls(response.content)
+
+  private async _runLoop(loopCtx: RunLoopContext): Promise<AgentResult> {
+    const {
+      mode,
+      agentMessages,
+      startTurn,
+      runId,
+      fixedHeader,
+      expiryMap,
+      schemas,
+      ctx,
+    } = loopCtx;
+
+    const {
+      task,
+      plan,
+      provider,
+      toolsUsed,
+      config: cfg,
+      hooks,
+      tokenBudget,
+    } = ctx;
+
+    const { onMessage, memory } = cfg;
+
+    let totalTokens = loopCtx.initialTokens;
+    let lastInputTokens = loopCtx.initialLastInputTokens;
+    const filesChanged: string[] = [];
+
+    for (let turn = startTurn; turn <= this.maxTurns; turn++) {
+      // ── Abort check ──────────────────────────────────────────────────────
       if (cfg.signal?.aborted) {
         onMessage({ type: "agentDone", text: "Task aborted." });
         return {
@@ -286,9 +468,9 @@ export class Executor {
         };
       }
 
-      // ── beforeTurn hook (AgentLifecycleHooks) ───────────────────────────────
-      // Receives full AgentTurnState snapshot. Can return Partial<AgentTurnState>
-      // to mutate state, or void/undefined to continue unchanged.
+      // ── beforeTurn hook ──────────────────────────────────────────────────
+      // Can return Partial<AgentTurnState> to mutate messages/totalTokens,
+      // or void/undefined to continue unchanged.
       if (hooks?.beforeTurn) {
         try {
           const state: AgentTurnState = {
@@ -315,32 +497,48 @@ export class Executor {
 
       onMessage({ type: "agentTurn", text: `⟳ Turn ${turn}/${this.maxTurns}` });
 
-      let response: any;
+      // ── Call AI — the only difference between native and prompt ──────────
+      let parsedToolCalls: ParsedToolCall[] = [];
+      let nativeToolCalls: CallAIWithToolsResult["tool_calls"] = undefined;
+      let responseContent: string | null = null;
+
       try {
-        console.log(`[Executor] Turn ${turn} - About to call API`);
-        //Ask the AI what to do next
-        response = await this.callAIWithToolsFn!(
-          agentMessages,
-          schemas,
-          provider,
-        );
+        console.log(`[Executor] Turn ${turn} (${mode}) - About to call API`);
 
-        const currentInputTokens = response.usage?.prompt_tokens ?? 0;
-        const newInputTokens = currentInputTokens - lastInputTokens;
-        const newOutputTokens = response.usage?.completion_tokens ?? 0;
-        const thisTurnTokens = Math.max(0, newInputTokens) + newOutputTokens;
-        totalTokens += thisTurnTokens;
-        lastInputTokens = currentInputTokens;
+        if (mode === "native") {
+          // Native: structured tool_calls from provider API
+          const response = await this.callAIWithToolsFn!(
+            agentMessages,
+            schemas!,
+            provider,
+          );
 
-        console.log(
-          `[Executor] Turn ${turn} - ` +
-            `input=${currentInputTokens} (+${Math.max(0, newInputTokens)} new) ` +
-            `output=${newOutputTokens} ` +
-            `turn_cost=${thisTurnTokens} ` +
-            `running_total=${totalTokens}`,
-        );
+          const currentInputTokens = response.usage?.prompt_tokens ?? 0;
+          const newInputTokens = currentInputTokens - lastInputTokens;
+          const newOutputTokens = response.usage?.completion_tokens ?? 0;
+          const thisTurnTokens = Math.max(0, newInputTokens) + newOutputTokens;
+          totalTokens += thisTurnTokens;
+          lastInputTokens = currentInputTokens;
+
+          console.log(
+            `[Executor] Turn ${turn} - ` +
+              `input=${currentInputTokens} (+${Math.max(0, newInputTokens)} new) ` +
+              `output=${newOutputTokens} ` +
+              `turn_cost=${thisTurnTokens} ` +
+              `running_total=${totalTokens}`,
+          );
+
+          nativeToolCalls = response.tool_calls;
+          responseContent = response.content ?? null;
+        } else {
+          // Prompt: parse JSON tool calls from plain text response
+          const response = await this.callAIFn!(agentMessages, provider);
+          totalTokens += response.usage?.total_tokens ?? 0;
+          responseContent = response.content;
+          parsedToolCalls = this._parseAllToolCalls(response.content);
+        }
       } catch (err: any) {
-        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
+        // ── onError hook ────────────────────────────────────────────────────
         if (hooks?.onError) {
           try {
             await hooks.onError(
@@ -361,10 +559,7 @@ export class Executor {
         };
       }
 
-      // ── shouldContinue hook (AgentLifecycleHooks) ────────────────────────
-      // Called after every turn. TokenBudgetHooks.shouldContinue handles budget
-      // enforcement here — no separate tokenBudget check needed.
-      // Also used by TurnLimitHooks and any custom continue conditions.
+      // ── shouldContinue hook ──────────────────────────────────────────────
       if (hooks?.shouldContinue) {
         try {
           const cont = await hooks.shouldContinue(
@@ -397,7 +592,6 @@ export class Executor {
       }
 
       // ── Raw token budget fallback — only fires if no hooks are wired ─────
-      // If AgentLifecycleHooks are set, use TokenBudgetHooks.shouldContinue instead.
       if (
         !hooks?.shouldContinue &&
         tokenBudget !== undefined &&
@@ -419,40 +613,91 @@ export class Executor {
         };
       }
 
-      //  Check if AI wants to do anything
-      if (!response.tool_calls || response.tool_calls.length === 0) {
-        const text = response.content ?? "";
-        onMessage({
-          type: "agentDone",
-          text: `${text || "Task complete."}`,
-        });
-        return {
-          success: true,
-          summary: this._buildSummary(
+      // ── Termination check ────────────────────────────────────────────────
+      // Native: no tool_calls = model finished naturally
+      // Prompt: no parsed tool calls = model returned plain text final answer
+      if (mode === "native") {
+        if (!nativeToolCalls || nativeToolCalls.length === 0) {
+          const text = responseContent ?? "";
+          onMessage({ type: "agentDone", text: text || "Task complete." });
+          return {
+            success: true,
+            summary: this._buildSummary(
+              task,
+              text || "Task complete.",
+              toolsUsed,
+              turn,
+            ),
+            toolsUsed,
+            turnsUsed: turn,
+            filesChanged,
+            tokensUsed: totalTokens,
+            runId,
+          };
+        }
+      } else {
+        // Prompt: all-done shortcut — if every parsed call is "done"
+        if (
+          parsedToolCalls.length > 0 &&
+          parsedToolCalls.every((tc) => tc.tool === "done")
+        ) {
+          return this._handleDone(
+            parsedToolCalls[0].args,
+            agentMessages,
             task,
-            text || "Task complete.",
             toolsUsed,
             turn,
-          ),
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          runId,
-        };
+            filesChanged,
+            totalTokens,
+            runId,
+            onMessage,
+          );
+        }
+
+        if (parsedToolCalls.length === 0) {
+          const clean = this._cleanDoneMessage(responseContent ?? "");
+          onMessage({ type: "agentDone", text: clean });
+          return {
+            success: true,
+            summary: this._buildSummary(task, clean, toolsUsed, turn),
+            toolsUsed,
+            turnsUsed: turn,
+            filesChanged,
+            tokensUsed: totalTokens,
+            runId,
+          };
+        }
       }
 
-      agentMessages.push({
-        role: "assistant",
-        content: response.content,
-        tool_calls: response.tool_calls,
-      });
+      // ── Push assistant message ───────────────────────────────────────────
+      if (mode === "native") {
+        agentMessages.push({
+          role: "assistant",
+          content: responseContent,
+          tool_calls: nativeToolCalls,
+        });
+      } else {
+        agentMessages.push({ role: "assistant", content: responseContent });
+      }
 
-      // AI requested tools, execute them
-      for (const toolCall of response.tool_calls) {
-        const { id, function: func } = toolCall;
-        const toolName = func.name;
-        const toolArgs = JSON.parse(func.arguments || "{}");
+      // ── Tool execution loop ──────────────────────────────────────────────
+      // Resolve tool calls — native uses tool_calls array, prompt uses parsed list
+      const toolCallsToExecute =
+        mode === "native"
+          ? nativeToolCalls!.map((tc) => ({
+              id: tc.id,
+              name: tc.function.name,
+              args: JSON.parse(tc.function.arguments || "{}"),
+            }))
+          : parsedToolCalls.map((tc) => ({
+              id: undefined as string | undefined,
+              name: tc.tool,
+              args: tc.args,
+            }));
+
+      for (const toolCall of toolCallsToExecute) {
+        const toolName = toolCall.name;
+        const toolArgs = toolCall.args;
 
         /**
          * Intercept "done" before it reaches executeToolFn.
@@ -475,6 +720,7 @@ export class Executor {
           );
         }
 
+        // ── Loop detection ─────────────────────────────────────────────────
         if (this.loopDetector.detectToolLoop(toolName, toolArgs)) {
           onMessage({
             type: "agentTool",
@@ -492,13 +738,12 @@ export class Executor {
           };
         }
 
-        // ── beforeTurn state refresh not needed here — tool loop is within a turn
-
         onMessage({
           type: "agentTool",
           text: `${toolName}(${Object.keys(toolArgs).join(", ")})`,
         });
 
+        // ── Execute tool ───────────────────────────────────────────────────
         let toolResult: { tool: string; success: boolean; output: string };
         try {
           toolResult = await this.executeToolFn!(
@@ -528,15 +773,13 @@ export class Executor {
               toolArgs.path || toolArgs.filePath || "terminal";
             filesChanged.push(changedPath);
             memory?.trackFileTouched(changedPath);
-            // onToolExecuted was called twice for editFile/createFile —
-            // once in the outer if-block and again in a redundant inner check.
-            // The duplicate caused double cache invalidation. Now called exactly once.
+            // notify once on file mutations — avoids double cache invalidation
             cfg.onToolExecuted?.(toolName);
           }
         }
 
-        // ── afterToolExecution hook (AgentLifecycleHooks) ───────────────────
-        // Receives full ToolExecutionContext. Can mutate or nullify the result.
+        // ── afterToolExecution hook ────────────────────────────────────────
+        // Can mutate or nullify the result.
         // null return = skip adding this result to messages (AI never sees it).
         if (hooks?.afterToolExecution) {
           try {
@@ -552,350 +795,6 @@ export class Executor {
               toolCtx,
             );
             if (mutated === null) {
-              // Hook nullified this result — skip pushing to messages entirely
-              continue;
-            }
-            toolResult = mutated;
-          } catch (err: any) {
-            onMessage({
-              type: "agentTool",
-              text: `afterToolExecution hook threw: ${err.message ?? err}`,
-            });
-          }
-        }
-
-        const compactContent = toolResult.success
-          ? this._compactToolResult(toolName, toolResult.output)
-          : `Error: ${toolResult.output}\n\nTry a different approach.`;
-
-        // Tell AI what happened
-        agentMessages.push({
-          role: "tool",
-          tool_call_id: id,
-          content: compactContent,
-        });
-
-        const ttl = this._getTTL(toolName);
-        expiryMap.set(agentMessages.length - 1, turn + ttl);
-      }
-
-      this._pruneMessages(agentMessages, expiryMap, turn, fixedHeader);
-
-      // ── Save checkpoint after every turn ─────────────────────────────────
-      // include fixedHeader so resume uses the correct value.
-      // serialise expiryMap so pruning resumes correctly.
-      // include runId to isolate concurrent runs of the same task.
-      this.saveCheckpoint({
-        task,
-        plan,
-        turn,
-        messages: [...agentMessages],
-        filesChanged: [...filesChanged],
-        toolsUsed: [...toolsUsed],
-        tokensUsed: totalTokens,
-        lastInputTokens,
-        timestamp: Date.now(),
-        fixedHeader,
-        expiryMap: Array.from(expiryMap.entries()),
-        runId,
-      });
-    }
-    console.log(`[Executor] Returning result with tokensUsed: ${totalTokens}`);
-    // returns totalTokens (cumulative cost across all turns).
-    return {
-      success: false,
-      summary: this._buildCapSummary(task, toolsUsed, this.maxTurns),
-      toolsUsed,
-      turnsUsed: this.maxTurns,
-      filesChanged,
-      tokensUsed: totalTokens,
-      runId,
-    };
-  }
-
-  private async _runPrompt(ctx: ExecutorContext): Promise<AgentResult> {
-    let totalTokens = 0;
-    const {
-      task,
-      plan,
-      provider,
-      projectContext,
-      toolsUsed,
-      config: cfg,
-      hooks,
-      tokenBudget,
-    } = ctx;
-    const { onMessage, memory } = cfg;
-    const filesChanged: string[] = [];
-
-    // unique runId per run() invocation
-    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
-
-    const agentMessages: Message[] = [
-      {
-        role: "system",
-        content:
-          this._resolveSystemPrompt(projectContext, cfg) +
-          "\n\n" +
-          (this.buildToolPromptFn ? this.buildToolPromptFn() : ""),
-      },
-      {
-        role: "user",
-        content: `${cfg.userPrompt ? cfg.userPrompt + "\n\n" : ""}Task: ${task}`,
-      },
-    ];
-
-    if (plan.trim()) {
-      agentMessages.push({
-        role: "assistant",
-        content: `Here is my plan:\n${plan.trim()}`,
-      });
-      agentMessages.push({
-        role: "user",
-        content: "Good. Now execute the plan step by step using your tools.",
-      });
-    }
-
-    // store real fixedHeader, not a hardcoded guess
-    const fixedHeader = agentMessages.length;
-    const expiryMap = new Map<number, number>();
-    for (let turn = 1; turn <= this.maxTurns; turn++) {
-      // ── Abort check — checked at the start of every turn ─────────────────
-      if (cfg.signal?.aborted) {
-        onMessage({ type: "agentDone", text: "Task aborted." });
-        return {
-          success: false,
-          summary: `Task aborted after ${turn - 1} turn(s).`,
-          toolsUsed,
-          turnsUsed: turn - 1,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: "AbortError",
-          runId,
-        };
-      }
-
-      // ── beforeTurn hook (AgentLifecycleHooks) ───────────────────────────────
-      if (hooks?.beforeTurn) {
-        try {
-          const state: AgentTurnState = {
-            turn,
-            messages: agentMessages,
-            currentTask: task,
-            toolsUsedSoFar: [...toolsUsed],
-            totalTokens,
-            filesChanged: [...filesChanged],
-          };
-          const mutation = await hooks.beforeTurn(state);
-          totalTokens = this._applyBeforeTurnMutation(
-            mutation,
-            agentMessages,
-            totalTokens,
-          );
-        } catch (err: any) {
-          onMessage({
-            type: "agentTool",
-            text: `beforeTurn hook threw: ${err.message ?? err}`,
-          });
-        }
-      }
-
-      onMessage({ type: "agentTurn", text: `⟳ Turn ${turn}/${this.maxTurns}` });
-
-      let response: CallAIResult;
-      try {
-        response = await this.callAIFn!(agentMessages, provider);
-      } catch (err: any) {
-        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
-        if (hooks?.onError) {
-          try {
-            await hooks.onError(
-              err instanceof Error ? err : new Error(String(err)),
-              { turn, task },
-            );
-          } catch {}
-        }
-        return {
-          success: false,
-          summary: `Agent stopped — AI call failed on turn ${turn}: ${err.message}`,
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: err.message,
-          runId,
-        };
-      }
-
-      // ── Token tracking ────────────────────────────────────────────────────
-      const thisTurnTokens = response.usage?.total_tokens ?? 0;
-      totalTokens += thisTurnTokens;
-
-      // ── shouldContinue hook (AgentLifecycleHooks) ────────────────────────
-      if (hooks?.shouldContinue) {
-        try {
-          const cont = await hooks.shouldContinue(
-            turn,
-            agentMessages,
-            this.maxTurns - turn,
-          );
-          if (!cont) {
-            onMessage({
-              type: "agentDone",
-              text: "Run stopped by shouldContinue hook.",
-            });
-            return {
-              success: false,
-              summary: `Run stopped by hook after turn ${turn}.`,
-              toolsUsed,
-              turnsUsed: turn,
-              filesChanged,
-              tokensUsed: totalTokens,
-              error: "HookAbort",
-              runId,
-            };
-          }
-        } catch (err: any) {
-          onMessage({
-            type: "agentTool",
-            text: `shouldContinue hook threw: ${err.message ?? err}`,
-          });
-        }
-      }
-
-      // ── Raw token budget fallback — only if no hooks wired ───────────────
-      if (
-        !hooks?.shouldContinue &&
-        tokenBudget !== undefined &&
-        totalTokens > tokenBudget
-      ) {
-        onMessage({
-          type: "agentDone",
-          text: `Token budget exceeded (${totalTokens}/${tokenBudget}).`,
-        });
-        return {
-          success: false,
-          summary: `Run stopped — token budget of ${tokenBudget} exceeded at turn ${turn} (used ${totalTokens}).`,
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: "TokenBudgetExceeded",
-          runId,
-        };
-      }
-
-      const raw = response.content;
-      const toolCalls = this._parseAllToolCalls(raw);
-
-      // If the only action is "done", treat it as termination
-      if (toolCalls.length > 0 && toolCalls.every((tc) => tc.tool === "done")) {
-        const doneArgs = toolCalls[0].args as any;
-        const summary = doneArgs.summary ?? doneArgs.message ?? "";
-        const clean = summary
-          ? this._cleanDoneMessage(summary)
-          : this._cleanDoneMessage(raw);
-        onMessage({ type: "agentDone", text: clean });
-        return {
-          success: true,
-          summary: this._buildSummary(task, clean, toolsUsed, turn),
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          runId,
-        };
-      }
-
-      if (toolCalls.length === 0) {
-        const clean = this._cleanDoneMessage(raw);
-        onMessage({ type: "agentDone", text: `${clean}` });
-        return {
-          success: true,
-          summary: this._buildSummary(task, clean, toolsUsed, turn),
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          runId,
-        };
-      }
-
-      agentMessages.push({ role: "assistant", content: raw });
-
-      for (const { tool, args } of toolCalls) {
-        // ── done is a termination signal, not an executable tool ────────────────
-        /**
-         * Intercept "done" before it reaches executeToolFn.
-         * Some models (e.g. Cerebras) emit "done" as a native tool call
-         * instead of stopping naturally. Treating it as a termination signal
-         * here saves a round-trip and surfaces the last tool result as the
-         * final summary.
-         */
-        if (tool === "done") {
-          return this._handleDone(
-            args,
-            agentMessages,
-            task,
-            toolsUsed,
-            turn,
-            filesChanged,
-            totalTokens,
-            runId,
-            onMessage,
-          );
-        }
-
-        // tool will be filtered via afterToolExecution if needed
-
-        onMessage({
-          type: "agentTool",
-          text: ` ${tool}(${Object.keys(args).join(", ")})`,
-        });
-
-        let toolResult: { tool: string; success: boolean; output: string };
-        try {
-          toolResult = await this.executeToolFn!(tool, args, onMessage, cfg);
-        } catch (err: any) {
-          toolResult = {
-            tool,
-            success: false,
-            output: `Error: ${err.message}`,
-          };
-        }
-
-        toolsUsed.push(tool);
-        memory?.trackToolUsed(tool);
-
-        if (toolResult.success) {
-          if (
-            tool === "editFile" ||
-            tool === "createFile" ||
-            tool === "runTerminal"
-          ) {
-            const changedPath = args.path || args.filePath || "terminal";
-            filesChanged.push(changedPath);
-            memory?.trackFileTouched(changedPath);
-            // Mirror _runNative: notify once on file mutations
-            cfg.onToolExecuted?.(tool);
-          }
-        }
-
-        // ── afterToolExecution hook (AgentLifecycleHooks) ───────────────────
-        if (hooks?.afterToolExecution) {
-          try {
-            const toolCtx: ToolExecutionContext = {
-              tool,
-              args,
-              turn,
-              taskContext: task,
-            };
-            const mutated = await hooks.afterToolExecution(
-              tool,
-              toolResult,
-              toolCtx,
-            );
-            if (mutated === null) {
               continue; // hook nullified this result — skip pushing to messages
             }
             toolResult = mutated;
@@ -907,24 +806,39 @@ export class Executor {
           }
         }
 
-        const compactOutput = toolResult.success
-          ? this._compactToolResult(tool, toolResult.output)
-          : toolResult.output;
+        // ── Push tool result to messages ───────────────────────────────────
+        // native: role="tool" with tool_call_id (OpenAI protocol)
+        // prompt: role="user" with text prefix (prompt injection protocol)
+        if (mode === "native") {
+          const compactContent = toolResult.success
+            ? this._compactToolResult(toolName, toolResult.output)
+            : `Error: ${toolResult.output}\n\nTry a different approach.`;
 
-        agentMessages.push({
-          role: "user",
-          content: toolResult.success
-            ? `Tool result [${tool}]:\n${compactOutput}`
-            : `Tool error [${tool}]:\n${compactOutput}\n\nTry a different approach.`,
-        });
+          agentMessages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: compactContent,
+          });
+        } else {
+          const compactOutput = toolResult.success
+            ? this._compactToolResult(toolName, toolResult.output)
+            : toolResult.output;
 
-        const ttl = this._getTTL(tool);
+          agentMessages.push({
+            role: "user",
+            content: toolResult.success
+              ? `Tool result [${toolName}]:\n${compactOutput}`
+              : `Tool error [${toolName}]:\n${compactOutput}\n\nTry a different approach.`,
+          });
+        }
+
+        const ttl = this._getTTL(toolName);
         expiryMap.set(agentMessages.length - 1, turn + ttl);
       }
 
       this._pruneMessages(agentMessages, expiryMap, turn, fixedHeader);
 
-      // ── Save checkpoint after every turn ─────────────────────────────────
+      // ── Save checkpoint after every turn ──────────────────────────────────
       this.saveCheckpoint({
         task,
         plan,
@@ -933,7 +847,8 @@ export class Executor {
         filesChanged: [...filesChanged],
         toolsUsed: [...toolsUsed],
         tokensUsed: totalTokens,
-        lastInputTokens: 0, // prompt mode doesn't track input tokens separately
+        // native tracks lastInputTokens for delta; prompt mode always 0
+        lastInputTokens: mode === "native" ? lastInputTokens : 0,
         timestamp: Date.now(),
         fixedHeader,
         expiryMap: Array.from(expiryMap.entries()),
@@ -941,6 +856,7 @@ export class Executor {
       });
     }
 
+    console.log(`[Executor] Returning result with tokensUsed: ${totalTokens}`);
     return {
       success: false,
       summary: this._buildCapSummary(task, toolsUsed, this.maxTurns),
@@ -952,648 +868,7 @@ export class Executor {
     };
   }
 
-  async executeFromCheckpoint(
-    cp: ExecutorCheckpoint,
-    // Accept full ExecutorContext so hooks, tokenBudget, and provider
-    // override all flow in exactly as they do for a fresh _runNative run.
-    ctx: ExecutorContext,
-  ): Promise<AgentResult> {
-    const { task, plan, messages, filesChanged, toolsUsed } = cp;
-    let totalTokens = cp.tokensUsed;
-    let lastInputTokens = cp.lastInputTokens;
-    const { config: cfg, hooks, tokenBudget, provider } = ctx;
-    const { onMessage, memory } = cfg;
-    const schemas = this.buildToolSchemasForProvider!(provider);
-    const agentMessages = [...messages];
-
-    // restore the real fixedHeader saved at run start instead of
-    // using a hardcoded guess of 4. An incorrect fixedHeader causes _pruneMessages
-    // to discard system/user messages, producing hallucinated context.
-    const fixedHeader = cp.fixedHeader;
-
-    // restore expiryMap from checkpoint so _pruneMessages correctly
-    // expires old tool results. An empty expiryMap means nothing is ever pruned
-    // and the context window grows unboundedly.
-    const expiryMap = new Map<number, number>(cp.expiryMap);
-
-    // resume from NEXT turn after checkpoint
-    for (let turn = cp.turn + 1; turn <= this.maxTurns; turn++) {
-      // ── Abort check ──────────────────────────────────────────────────────
-      if (cfg.signal?.aborted) {
-        onMessage({ type: "agentDone", text: "Task aborted." });
-        return {
-          success: false,
-          summary: `Task aborted after ${turn - 1} turn(s).`,
-          toolsUsed,
-          turnsUsed: turn - 1,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: "AbortError",
-          runId: cp.runId,
-        };
-      }
-
-      // ── beforeTurn hook — mirrors _runNative ─────────────────────────────
-      if (hooks?.beforeTurn) {
-        try {
-          const state: AgentTurnState = {
-            turn,
-            messages: agentMessages,
-            currentTask: task,
-            toolsUsedSoFar: [...toolsUsed],
-            totalTokens,
-            filesChanged: [...filesChanged],
-          };
-          const mutation = await hooks.beforeTurn(state);
-          totalTokens = this._applyBeforeTurnMutation(
-            mutation,
-            agentMessages,
-            totalTokens,
-          );
-        } catch (err: any) {
-          onMessage({
-            type: "agentTool",
-            text: `beforeTurn hook threw: ${err.message ?? err}`,
-          });
-        }
-      }
-
-      onMessage({ type: "agentTurn", text: `⟳ Turn ${turn}/${this.maxTurns}` });
-
-      let response: any;
-      try {
-        console.log(`[Executor] Resume Turn ${turn} - About to call API`);
-        response = await this.callAIWithToolsFn!(
-          agentMessages,
-          schemas,
-          provider,
-        );
-
-        const currentInputTokens = response.usage?.prompt_tokens ?? 0;
-        const newInputTokens = currentInputTokens - lastInputTokens;
-        const newOutputTokens = response.usage?.completion_tokens ?? 0;
-        const thisTurnTokens = Math.max(0, newInputTokens) + newOutputTokens;
-        totalTokens += thisTurnTokens;
-        lastInputTokens = currentInputTokens;
-
-        console.log(
-          `[Executor] Resume Turn ${turn} - input=${currentInputTokens} output=${newOutputTokens} total=${totalTokens}`,
-        );
-      } catch (err: any) {
-        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
-        if (hooks?.onError) {
-          try {
-            await hooks.onError(
-              err instanceof Error ? err : new Error(String(err)),
-              { turn, task },
-            );
-          } catch {}
-        }
-        return {
-          success: false,
-          summary: `Agent stopped on resume turn ${turn}: ${err.message}`,
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: err.message,
-        };
-      }
-
-      // ── shouldContinue hook — mirrors _runNative ─────────────────────────
-      if (hooks?.shouldContinue) {
-        try {
-          const cont = await hooks.shouldContinue(
-            turn,
-            agentMessages,
-            this.maxTurns - turn,
-          );
-          if (!cont) {
-            onMessage({
-              type: "agentDone",
-              text: "Run stopped by shouldContinue hook.",
-            });
-            return {
-              success: false,
-              summary: `Run stopped by hook after turn ${turn}.`,
-              toolsUsed,
-              turnsUsed: turn,
-              filesChanged,
-              tokensUsed: totalTokens,
-              error: "HookAbort",
-              runId: cp.runId,
-            };
-          }
-        } catch (err: any) {
-          onMessage({
-            type: "agentTool",
-            text: `shouldContinue hook threw: ${err.message ?? err}`,
-          });
-        }
-      }
-
-      // ── Raw token budget fallback — only if no hooks wired ───────────────
-      if (
-        !hooks?.shouldContinue &&
-        tokenBudget !== undefined &&
-        totalTokens > tokenBudget
-      ) {
-        onMessage({
-          type: "agentDone",
-          text: `Token budget exceeded (${totalTokens}/${tokenBudget}).`,
-        });
-        return {
-          success: false,
-          summary: `Run stopped — token budget of ${tokenBudget} exceeded at turn ${turn} (used ${totalTokens}).`,
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: "TokenBudgetExceeded",
-          runId: cp.runId,
-        };
-      }
-
-      if (!response.tool_calls || response.tool_calls.length === 0) {
-        const text = response.content ?? "";
-        onMessage({ type: "agentDone", text: `${text || "Task complete."}` });
-        return {
-          success: true,
-          summary: this._buildSummary(
-            task,
-            text || "Task complete.",
-            toolsUsed,
-            turn,
-          ),
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          runId: cp.runId,
-        };
-      }
-
-      agentMessages.push({
-        role: "assistant",
-        content: response.content,
-        tool_calls: response.tool_calls,
-      });
-
-      for (const toolCall of response.tool_calls) {
-        const { id, function: func } = toolCall;
-        const toolName = func.name;
-        const toolArgs = JSON.parse(func.arguments || "{}");
-
-        /**
-         * Intercept "done" before it reaches executeToolFn.
-         * Some models (e.g. Cerebras) emit "done" as a native tool call
-         * instead of stopping naturally. Treating it as a termination signal
-         * here saves a round-trip and surfaces the last tool result as the
-         * final summary.
-         */
-        if (toolName === "done") {
-          return this._handleDone(
-            toolArgs,
-            agentMessages,
-            task,
-            toolsUsed,
-            turn,
-            filesChanged,
-            totalTokens,
-            cp.runId,
-            onMessage,
-          );
-        }
-
-        // ── Loop detection — mirrors _runNative ──────────────────────────
-        if (this.loopDetector.detectToolLoop(toolName, toolArgs)) {
-          onMessage({
-            type: "agentTool",
-            text: `🔄 Loop detected: ${toolName} called repeatedly. Stopping.`,
-          });
-          return {
-            success: false,
-            summary: `Agent stopped — detected tool loop on ${toolName}`,
-            toolsUsed,
-            turnsUsed: turn,
-            filesChanged,
-            tokensUsed: totalTokens,
-            error: "Tool loop detected",
-            runId: cp.runId,
-          };
-        }
-
-        onMessage({
-          type: "agentTool",
-          text: `${toolName}(${Object.keys(toolArgs).join(", ")})`,
-        });
-
-        let toolResult: { tool: string; success: boolean; output: string };
-        try {
-          toolResult = await this.executeToolFn!(
-            toolName,
-            toolArgs,
-            onMessage,
-            cfg,
-          );
-        } catch (err: any) {
-          toolResult = {
-            tool: toolName,
-            success: false,
-            output: `Error: ${err.message}`,
-          };
-        }
-
-        toolsUsed.push(toolName);
-        memory?.trackToolUsed(toolName);
-
-        // ── runTerminal added — mirrors _runNative (was missing on resume) ─
-        if (toolResult.success) {
-          if (
-            toolName === "editFile" ||
-            toolName === "createFile" ||
-            toolName === "runTerminal"
-          ) {
-            const changedPath =
-              toolArgs.path || toolArgs.filePath || "terminal";
-            filesChanged.push(changedPath);
-            memory?.trackFileTouched(changedPath);
-            cfg.onToolExecuted?.(toolName);
-          }
-        }
-
-        // ── afterToolExecution hook — mirrors _runNative ─────────────────
-        if (hooks?.afterToolExecution) {
-          try {
-            const toolCtx: ToolExecutionContext = {
-              tool: toolName,
-              args: toolArgs,
-              turn,
-              taskContext: task,
-            };
-            const mutated = await hooks.afterToolExecution(
-              toolName,
-              toolResult,
-              toolCtx,
-            );
-            if (mutated === null) {
-              continue;
-            }
-            toolResult = mutated;
-          } catch (err: any) {
-            onMessage({
-              type: "agentTool",
-              text: `afterToolExecution hook threw: ${err.message ?? err}`,
-            });
-          }
-        }
-
-        // ── Consistent error format — mirrors _runNative ─────────────────
-        const compactContent = toolResult.success
-          ? this._compactToolResult(toolName, toolResult.output)
-          : `Error: ${toolResult.output}\n\nTry a different approach.`;
-
-        agentMessages.push({
-          role: "tool",
-          tool_call_id: id,
-          content: compactContent,
-        });
-
-        const ttl = this._getTTL(toolName);
-        expiryMap.set(agentMessages.length - 1, turn + ttl);
-      }
-
-      this._pruneMessages(agentMessages, expiryMap, turn, fixedHeader);
-
-      this.saveCheckpoint({
-        task,
-        plan,
-        turn,
-        messages: [...agentMessages],
-        filesChanged: [...filesChanged],
-        toolsUsed: [...toolsUsed],
-        tokensUsed: totalTokens,
-        lastInputTokens,
-        timestamp: Date.now(),
-        fixedHeader,
-        expiryMap: Array.from(expiryMap.entries()),
-        runId: cp.runId,
-      });
-    }
-
-    return {
-      success: false,
-      summary: this._buildCapSummary(task, toolsUsed, this.maxTurns),
-      toolsUsed,
-      turnsUsed: this.maxTurns,
-      filesChanged,
-      tokensUsed: totalTokens,
-      runId: cp.runId,
-    };
-  }
-
-  async executeFromCheckpointPrompt(
-    cp: ExecutorCheckpoint,
-    // Accept full ExecutorContext so hooks, tokenBudget, and provider
-    // override all flow in exactly as they do for a fresh _runPrompt run.
-    ctx: ExecutorContext,
-  ): Promise<AgentResult> {
-    const { task, plan, messages, filesChanged, toolsUsed } = cp;
-    let totalTokens = cp.tokensUsed;
-    const { config: cfg, hooks, tokenBudget, provider } = ctx;
-    const { onMessage, memory } = cfg;
-    const agentMessages: Message[] = [...messages];
-
-    // use real fixedHeader from checkpoint, not hardcoded 4
-    const fixedHeader = cp.fixedHeader;
-    // restore expiryMap so pruning works correctly on resume
-    const expiryMap = new Map<number, number>(cp.expiryMap);
-
-    for (let turn = cp.turn + 1; turn <= this.maxTurns; turn++) {
-      // ── Abort check ──────────────────────────────────────────────────────
-      if (cfg.signal?.aborted) {
-        onMessage({ type: "agentDone", text: "Task aborted." });
-        return {
-          success: false,
-          summary: `Task aborted after ${turn - 1} turn(s).`,
-          toolsUsed,
-          turnsUsed: turn - 1,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: "AbortError",
-          runId: cp.runId,
-        };
-      }
-
-      // ── beforeTurn hook — mirrors _runPrompt ─────────────────────────────
-      if (hooks?.beforeTurn) {
-        try {
-          const state: AgentTurnState = {
-            turn,
-            messages: agentMessages,
-            currentTask: task,
-            toolsUsedSoFar: [...toolsUsed],
-            totalTokens,
-            filesChanged: [...filesChanged],
-          };
-          const mutation = await hooks.beforeTurn(state);
-          totalTokens = this._applyBeforeTurnMutation(
-            mutation,
-            agentMessages,
-            totalTokens,
-          );
-        } catch (err: any) {
-          onMessage({
-            type: "agentTool",
-            text: `beforeTurn hook threw: ${err.message ?? err}`,
-          });
-        }
-      }
-
-      onMessage({ type: "agentTurn", text: `⟳ Turn ${turn}/${this.maxTurns}` });
-
-      let response: CallAIResult;
-      try {
-        console.log(
-          `[Executor] Resume Prompt Turn ${turn} - About to call API`,
-        );
-        response = await this.callAIFn!(agentMessages, provider);
-        totalTokens += response.usage?.total_tokens ?? 0;
-      } catch (err: any) {
-        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
-        if (hooks?.onError) {
-          try {
-            await hooks.onError(
-              err instanceof Error ? err : new Error(String(err)),
-              { turn, task },
-            );
-          } catch {}
-        }
-        return {
-          success: false,
-          summary: `Agent stopped on resume turn ${turn}: ${err.message}`,
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: err.message,
-          runId: cp.runId,
-        };
-      }
-
-      // ── shouldContinue hook — mirrors _runPrompt ─────────────────────────
-      if (hooks?.shouldContinue) {
-        try {
-          const cont = await hooks.shouldContinue(
-            turn,
-            agentMessages,
-            this.maxTurns - turn,
-          );
-          if (!cont) {
-            onMessage({
-              type: "agentDone",
-              text: "Run stopped by shouldContinue hook.",
-            });
-            return {
-              success: false,
-              summary: `Run stopped by hook after turn ${turn}.`,
-              toolsUsed,
-              turnsUsed: turn,
-              filesChanged,
-              tokensUsed: totalTokens,
-              error: "HookAbort",
-              runId: cp.runId,
-            };
-          }
-        } catch (err: any) {
-          onMessage({
-            type: "agentTool",
-            text: `shouldContinue hook threw: ${err.message ?? err}`,
-          });
-        }
-      }
-
-      // ── Raw token budget fallback — only if no hooks wired ───────────────
-      if (
-        !hooks?.shouldContinue &&
-        tokenBudget !== undefined &&
-        totalTokens > tokenBudget
-      ) {
-        onMessage({
-          type: "agentDone",
-          text: `Token budget exceeded (${totalTokens}/${tokenBudget}).`,
-        });
-        return {
-          success: false,
-          summary: `Run stopped — token budget of ${tokenBudget} exceeded at turn ${turn} (used ${totalTokens}).`,
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          error: "TokenBudgetExceeded",
-          runId: cp.runId,
-        };
-      }
-
-      const raw = response.content;
-      const toolCalls = this._parseAllToolCalls(raw);
-
-      if (toolCalls.length === 0) {
-        const clean = this._cleanDoneMessage(raw);
-        onMessage({ type: "agentDone", text: `${clean}` });
-        return {
-          success: true,
-          summary: this._buildSummary(task, clean, toolsUsed, turn),
-          toolsUsed,
-          turnsUsed: turn,
-          filesChanged,
-          tokensUsed: totalTokens,
-          runId: cp.runId,
-        };
-      }
-
-      agentMessages.push({ role: "assistant", content: raw });
-
-      for (const { tool, args } of toolCalls) {
-        /**
-         * Intercept "done" before it reaches executeToolFn — mirrors _runPrompt.
-         * Treats it as a termination signal, surfaces last tool result as summary.
-         */
-        if (tool === "done") {
-          return this._handleDone(
-            args,
-            agentMessages,
-            task,
-            toolsUsed,
-            turn,
-            filesChanged,
-            totalTokens,
-            cp.runId,
-            onMessage,
-          );
-        }
-
-        // ── Loop detection — mirrors _runPrompt ──────────────────────────
-        if (this.loopDetector.detectToolLoop(tool, args)) {
-          onMessage({
-            type: "agentTool",
-            text: `🔄 Loop detected: ${tool} called repeatedly. Stopping.`,
-          });
-          return {
-            success: false,
-            summary: `Agent stopped — detected tool loop on ${tool}`,
-            toolsUsed,
-            turnsUsed: turn,
-            filesChanged,
-            tokensUsed: totalTokens,
-            error: "Tool loop detected",
-            runId: cp.runId,
-          };
-        }
-
-        onMessage({
-          type: "agentTool",
-          text: `${tool}(${Object.keys(args).join(", ")})`,
-        });
-
-        let toolResult: { tool: string; success: boolean; output: string };
-        try {
-          toolResult = await this.executeToolFn!(tool, args, onMessage, cfg);
-        } catch (err: any) {
-          toolResult = {
-            tool,
-            success: false,
-            output: `Error: ${err.message}`,
-          };
-        }
-
-        toolsUsed.push(tool);
-        memory?.trackToolUsed(tool);
-
-        // ── onToolExecuted added — was missing in original ────────────────
-        if (toolResult.success) {
-          if (
-            tool === "editFile" ||
-            tool === "createFile" ||
-            tool === "runTerminal"
-          ) {
-            const changedPath = args.path || args.filePath || "terminal";
-            filesChanged.push(changedPath);
-            memory?.trackFileTouched(changedPath);
-            cfg.onToolExecuted?.(tool);
-          }
-        }
-
-        // ── afterToolExecution hook — mirrors _runPrompt ─────────────────
-        if (hooks?.afterToolExecution) {
-          try {
-            const toolCtx: ToolExecutionContext = {
-              tool,
-              args,
-              turn,
-              taskContext: task,
-            };
-            const mutated = await hooks.afterToolExecution(
-              tool,
-              toolResult,
-              toolCtx,
-            );
-            if (mutated === null) {
-              continue;
-            }
-            toolResult = mutated;
-          } catch (err: any) {
-            onMessage({
-              type: "agentTool",
-              text: `afterToolExecution hook threw: ${err.message ?? err}`,
-            });
-          }
-        }
-
-        const compactOutput = toolResult.success
-          ? this._compactToolResult(tool, toolResult.output)
-          : toolResult.output;
-
-        agentMessages.push({
-          role: "user",
-          content: toolResult.success
-            ? `Tool result [${tool}]:\n${compactOutput}`
-            : `Tool error [${tool}]:\n${compactOutput}\n\nTry a different approach.`,
-        });
-
-        const ttl = this._getTTL(tool);
-        expiryMap.set(agentMessages.length - 1, turn + ttl);
-      }
-
-      this._pruneMessages(agentMessages, expiryMap, turn, fixedHeader);
-
-      // save updated checkpoint
-      this.saveCheckpoint({
-        task,
-        plan,
-        turn,
-        messages: [...agentMessages],
-        filesChanged: [...filesChanged],
-        toolsUsed: [...toolsUsed],
-        tokensUsed: totalTokens,
-        lastInputTokens: 0,
-        timestamp: Date.now(),
-        fixedHeader,
-        expiryMap: Array.from(expiryMap.entries()),
-        runId: cp.runId,
-      });
-    }
-
-    return {
-      success: false,
-      summary: this._buildCapSummary(task, toolsUsed, this.maxTurns),
-      toolsUsed,
-      turnsUsed: this.maxTurns,
-      filesChanged,
-      tokensUsed: totalTokens,
-      runId: cp.runId,
-    };
-  }
+  // ── Private helpers ───────────────────────────────────────────────────────
 
   private _resolveSystemPrompt(
     projectContext: string,
@@ -1602,7 +877,88 @@ export class Executor {
     return projectContext;
   }
 
-  // ── _cleanDoneMessage ────────────────────────────────────────────────
+  /**
+   * Shared termination handler for both native and prompt paths.
+   * Called when the model emits a "done" tool call in any execution path.
+   *
+   * Extracts a human-readable summary from the tool args if present,
+   * otherwise falls back to the last tool result in agentMessages.
+   * Emits agentDone and returns a successful AgentResult immediately,
+   * bypassing executeToolFn entirely.
+   */
+  private _handleDone(
+    toolArgs: Record<string, any>,
+    agentMessages: any[],
+    task: string,
+    toolsUsed: string[],
+    turn: number,
+    filesChanged: string[],
+    totalTokens: number,
+    runId: string,
+    onMessage: (msg: any) => void,
+  ): AgentResult {
+    const summary =
+      toolArgs.summary ??
+      toolArgs.message ??
+      toolArgs.result ??
+      toolArgs.text ??
+      toolArgs.output ??
+      "";
+    const clean = summary
+      ? this._cleanDoneMessage(String(summary))
+      : this._cleanDoneMessage(
+          (() => {
+            for (let i = agentMessages.length - 1; i >= 0; i--) {
+              const m = agentMessages[i];
+              // native path: role === "tool"
+              // prompt path: role === "user" with "Tool result [" prefix
+              if (
+                m?.role === "tool" ||
+                (m?.role === "user" &&
+                  typeof m?.content === "string" &&
+                  m.content.startsWith("Tool result ["))
+              ) {
+                return m.content;
+              }
+            }
+            return "Task complete.";
+          })(),
+        );
+    onMessage({ type: "agentDone", text: clean });
+    return {
+      success: true,
+      summary: this._buildSummary(task, clean, toolsUsed, turn),
+      toolsUsed,
+      turnsUsed: turn,
+      filesChanged,
+      tokensUsed: totalTokens,
+      runId,
+    };
+  }
+
+  /**
+   * Applies Partial<AgentTurnState> mutations returned by beforeTurn hook.
+   * Only messages and totalTokens affect execution — other fields are
+   * read-only snapshots passed for observation only.
+   */
+  private _applyBeforeTurnMutation(
+    mutation: Partial<AgentTurnState> | void,
+    agentMessages: any[],
+    totalTokens: number,
+  ): number {
+    if (!mutation || typeof mutation !== "object") return totalTokens;
+
+    if (Array.isArray(mutation.messages)) {
+      agentMessages.splice(0, agentMessages.length, ...mutation.messages);
+    }
+
+    return typeof mutation.totalTokens === "number"
+      ? mutation.totalTokens
+      : totalTokens;
+  }
+
+  // ── _cleanDoneMessage ────────────────────────────────────────────────────
+
   private _cleanDoneMessage(raw: string): string {
     const sentences = raw.split(/(?<=[.!?])\s+/);
     const seen = new Set<string>();
@@ -1644,7 +1000,7 @@ export class Executor {
     return `**Agent hit ${maxTurns}-turn limit**\n\nTask: "${task}"${toolChain}\n\nTry breaking the task into smaller steps.`;
   }
 
-  // ── TTL — how many turns a tool result stays in context ─────────────────
+  // ── TTL — how many turns a tool result stays in context ──────────────────
 
   private _getTTL(toolName: string): number {
     const TTL: Record<string, number> = {
@@ -1662,7 +1018,7 @@ export class Executor {
     return TTL[toolName] ?? 3;
   }
 
-  // ── Compact large tool outputs to stay under context limits ───────────────
+  // ── Compact large tool outputs to stay under context limits ──────────────
 
   private _compactToolResult(toolName: string, output: string): string {
     switch (toolName) {
@@ -1680,7 +1036,7 @@ export class Executor {
     }
   }
 
-  // ── Prune expired messages to stay under context limits ───────────────────
+  // ── Prune expired messages to stay under context limits ──────────────────
 
   private _pruneMessages(
     messages: any[],
@@ -1783,6 +1139,7 @@ export class Executor {
             .map((item: any) => ({ tool: item.tool, args: item.args ?? {} }));
           if (calls.length > 0) return calls;
 
+          // OpenAI {name, arguments} format — some models emit this in text
           const calls2 = parsed
             .filter(
               (item: any) =>
@@ -1890,86 +1247,5 @@ export class Executor {
       i = end !== -1 ? end + 1 : raw.length;
     }
     return results;
-  }
-
-  /**
-   * Shared termination handler for native tool-call mode.
-   * Called when the model emits a "done" tool call in either
-   * _runNative or executeFromCheckpoint.
-   *
-   * Extracts a human-readable summary from the tool args if present,
-   * otherwise falls back to the last tool result in agentMessages.
-   * Emits agentDone and returns a successful AgentResult immediately,
-   * bypassing executeToolFn entirely.
-   */
-  private _handleDone(
-    toolArgs: Record<string, any>,
-    agentMessages: any[],
-    task: string,
-    toolsUsed: string[],
-    turn: number,
-    filesChanged: string[],
-    totalTokens: number,
-    runId: string,
-    onMessage: (msg: any) => void,
-  ): AgentResult {
-    const summary =
-      toolArgs.summary ??
-      toolArgs.message ??
-      toolArgs.result ??
-      toolArgs.text ??
-      toolArgs.output ??
-      "";
-    const clean = summary
-      ? this._cleanDoneMessage(String(summary))
-      : this._cleanDoneMessage(
-          (() => {
-            for (let i = agentMessages.length - 1; i >= 0; i--) {
-              const m = agentMessages[i];
-              // native path: role === "tool"
-              // prompt path: role === "user" with "Tool result [" prefix
-              if (
-                m?.role === "tool" ||
-                (m?.role === "user" &&
-                  typeof m?.content === "string" &&
-                  m.content.startsWith("Tool result ["))
-              ) {
-                return m.content;
-              }
-            }
-            return "Task complete.";
-          })(),
-        );
-    onMessage({ type: "agentDone", text: clean });
-    return {
-      success: true,
-      summary: this._buildSummary(task, clean, toolsUsed, turn),
-      toolsUsed,
-      turnsUsed: turn,
-      filesChanged,
-      tokensUsed: totalTokens,
-      runId,
-    };
-  }
-
-  /**
-   * Applies Partial<AgentTurnState> mutations returned by beforeTurn hook.
-   * Only messages and totalTokens affect execution — other fields are
-   * read-only snapshots passed for observation only.
-   */
-  private _applyBeforeTurnMutation(
-    mutation: Partial<AgentTurnState> | void,
-    agentMessages: any[],
-    totalTokens: number,
-  ): number {
-    if (!mutation || typeof mutation !== "object") return totalTokens;
-
-    if (Array.isArray(mutation.messages)) {
-      agentMessages.splice(0, agentMessages.length, ...mutation.messages);
-    }
-
-    return typeof mutation.totalTokens === "number"
-      ? mutation.totalTokens
-      : totalTokens;
   }
 }
