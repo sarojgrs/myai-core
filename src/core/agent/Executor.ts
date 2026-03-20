@@ -299,7 +299,12 @@ export class Executor {
             totalTokens,
             filesChanged: [...filesChanged],
           };
-          await hooks.beforeTurn(state);
+          const mutation = await hooks.beforeTurn(state);
+          totalTokens = this._applyBeforeTurnMutation(
+            mutation,
+            agentMessages,
+            totalTokens,
+          );
         } catch (err: any) {
           onMessage({
             type: "agentTool",
@@ -681,7 +686,12 @@ export class Executor {
             totalTokens,
             filesChanged: [...filesChanged],
           };
-          await hooks.beforeTurn(state);
+          const mutation = await hooks.beforeTurn(state);
+          totalTokens = this._applyBeforeTurnMutation(
+            mutation,
+            agentMessages,
+            totalTokens,
+          );
         } catch (err: any) {
           onMessage({
             type: "agentTool",
@@ -696,6 +706,15 @@ export class Executor {
       try {
         response = await this.callAIFn!(agentMessages, provider);
       } catch (err: any) {
+        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
+        if (hooks?.onError) {
+          try {
+            await hooks.onError(
+              err instanceof Error ? err : new Error(String(err)),
+              { turn, task },
+            );
+          } catch {}
+        }
         return {
           success: false,
           summary: `Agent stopped — AI call failed on turn ${turn}: ${err.message}`,
@@ -970,6 +989,7 @@ export class Executor {
           filesChanged,
           tokensUsed: totalTokens,
           error: "AbortError",
+          runId: cp.runId,
         };
       }
 
@@ -984,7 +1004,12 @@ export class Executor {
             totalTokens,
             filesChanged: [...filesChanged],
           };
-          await hooks.beforeTurn(state);
+          const mutation = await hooks.beforeTurn(state);
+          totalTokens = this._applyBeforeTurnMutation(
+            mutation,
+            agentMessages,
+            totalTokens,
+          );
         } catch (err: any) {
           onMessage({
             type: "agentTool",
@@ -1015,7 +1040,7 @@ export class Executor {
           `[Executor] Resume Turn ${turn} - input=${currentInputTokens} output=${newOutputTokens} total=${totalTokens}`,
         );
       } catch (err: any) {
-        // ── onError hook — mirrors _runNative ───────────────────────────────
+        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
         if (hooks?.onError) {
           try {
             await hooks.onError(
@@ -1056,6 +1081,7 @@ export class Executor {
               filesChanged,
               tokensUsed: totalTokens,
               error: "HookAbort",
+              runId: cp.runId,
             };
           }
         } catch (err: any) {
@@ -1084,6 +1110,7 @@ export class Executor {
           filesChanged,
           tokensUsed: totalTokens,
           error: "TokenBudgetExceeded",
+          runId: cp.runId,
         };
       }
 
@@ -1102,6 +1129,7 @@ export class Executor {
           turnsUsed: turn,
           filesChanged,
           tokensUsed: totalTokens,
+          runId: cp.runId,
         };
       }
 
@@ -1151,6 +1179,7 @@ export class Executor {
             filesChanged,
             tokensUsed: totalTokens,
             error: "Tool loop detected",
+            runId: cp.runId,
           };
         }
 
@@ -1259,6 +1288,7 @@ export class Executor {
       turnsUsed: this.maxTurns,
       filesChanged,
       tokensUsed: totalTokens,
+      runId: cp.runId,
     };
   }
 
@@ -1291,6 +1321,7 @@ export class Executor {
           filesChanged,
           tokensUsed: totalTokens,
           error: "AbortError",
+          runId: cp.runId,
         };
       }
 
@@ -1305,7 +1336,12 @@ export class Executor {
             totalTokens,
             filesChanged: [...filesChanged],
           };
-          await hooks.beforeTurn(state);
+          const mutation = await hooks.beforeTurn(state);
+          totalTokens = this._applyBeforeTurnMutation(
+            mutation,
+            agentMessages,
+            totalTokens,
+          );
         } catch (err: any) {
           onMessage({
             type: "agentTool",
@@ -1324,6 +1360,15 @@ export class Executor {
         response = await this.callAIFn!(agentMessages, provider);
         totalTokens += response.usage?.total_tokens ?? 0;
       } catch (err: any) {
+        // ── onError hook (AgentLifecycleHooks) ───────────────────────────────
+        if (hooks?.onError) {
+          try {
+            await hooks.onError(
+              err instanceof Error ? err : new Error(String(err)),
+              { turn, task },
+            );
+          } catch {}
+        }
         return {
           success: false,
           summary: `Agent stopped on resume turn ${turn}: ${err.message}`,
@@ -1332,6 +1377,7 @@ export class Executor {
           filesChanged,
           tokensUsed: totalTokens,
           error: err.message,
+          runId: cp.runId,
         };
       }
 
@@ -1356,6 +1402,7 @@ export class Executor {
               filesChanged,
               tokensUsed: totalTokens,
               error: "HookAbort",
+              runId: cp.runId,
             };
           }
         } catch (err: any) {
@@ -1384,6 +1431,7 @@ export class Executor {
           filesChanged,
           tokensUsed: totalTokens,
           error: "TokenBudgetExceeded",
+          runId: cp.runId,
         };
       }
 
@@ -1400,12 +1448,31 @@ export class Executor {
           turnsUsed: turn,
           filesChanged,
           tokensUsed: totalTokens,
+          runId: cp.runId,
         };
       }
 
       agentMessages.push({ role: "assistant", content: raw });
 
       for (const { tool, args } of toolCalls) {
+        /**
+         * Intercept "done" before it reaches executeToolFn — mirrors _runPrompt.
+         * Treats it as a termination signal, surfaces last tool result as summary.
+         */
+        if (tool === "done") {
+          return this._handleDone(
+            args,
+            agentMessages,
+            task,
+            toolsUsed,
+            turn,
+            filesChanged,
+            totalTokens,
+            cp.runId,
+            onMessage,
+          );
+        }
+
         // ── Loop detection — mirrors _runPrompt ──────────────────────────
         if (this.loopDetector.detectToolLoop(tool, args)) {
           onMessage({
@@ -1420,6 +1487,7 @@ export class Executor {
             filesChanged,
             tokensUsed: totalTokens,
             error: "Tool loop detected",
+            runId: cp.runId,
           };
         }
 
@@ -1523,6 +1591,7 @@ export class Executor {
       turnsUsed: this.maxTurns,
       filesChanged,
       tokensUsed: totalTokens,
+      runId: cp.runId,
     };
   }
 
@@ -1533,6 +1602,7 @@ export class Executor {
     return projectContext;
   }
 
+  // ── _cleanDoneMessage ────────────────────────────────────────────────
   private _cleanDoneMessage(raw: string): string {
     const sentences = raw.split(/(?<=[.!?])\s+/);
     const seen = new Set<string>();
@@ -1880,5 +1950,26 @@ export class Executor {
       tokensUsed: totalTokens,
       runId,
     };
+  }
+
+  /**
+   * Applies Partial<AgentTurnState> mutations returned by beforeTurn hook.
+   * Only messages and totalTokens affect execution — other fields are
+   * read-only snapshots passed for observation only.
+   */
+  private _applyBeforeTurnMutation(
+    mutation: Partial<AgentTurnState> | void,
+    agentMessages: any[],
+    totalTokens: number,
+  ): number {
+    if (!mutation || typeof mutation !== "object") return totalTokens;
+
+    if (Array.isArray(mutation.messages)) {
+      agentMessages.splice(0, agentMessages.length, ...mutation.messages);
+    }
+
+    return typeof mutation.totalTokens === "number"
+      ? mutation.totalTokens
+      : totalTokens;
   }
 }

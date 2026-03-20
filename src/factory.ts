@@ -307,11 +307,42 @@ function buildAgentInternals(options: CreateAgentOptions): AgentInternals {
       return result;
     },
 
-    buildToolSchemas: () =>
+    /**
+     * Builds native tool schemas for providers that support structured tool calling
+     * (e.g. Codestral, Groq, OpenAI).
+     *
+     * Called by Executor._runNative() and executeFromCheckpoint() before each
+     * API call. The schemas are passed as the `tools` parameter to the provider
+     * API — the model never sees them as text, the API enforces structure.
+     *
+     * Includes: built-in tools + custom tools + toolRegistry tools,
+     * filtered by the active profile's allowedTools list.
+     *
+     * @param _provider - Reserved for future per-provider schema filtering.
+     *                    Prefixed with _ until filterToolsForProvider() is implemented.
+     */
+    buildToolSchemas: (_provider: string) =>
       providerEngine.buildNativeSchemas(
         profileManager.getAllowedTools(toolEngine.getAllDefinitions()), // toolDefs = built-in + custom + userRegisteredTools found!
       ),
 
+    /**
+     * Builds a plain-text tool description block for providers that do NOT
+     * support native tool calling (e.g. Cerebras, Gemini, Ollama).
+     *
+     * Called by Executor._runPrompt() and executeFromCheckpointPrompt() once
+     * at message setup. The block is injected into the system prompt so the
+     * model reads it as instructions and responds with JSON tool calls.
+     *
+     * Includes: built-in tools + custom tools + toolRegistry tools,
+     * filtered by the active profile's allowedTools list.
+     *
+     * Output format:
+     *   Available tools:
+     *   toolName(param1, param2?)
+     *     Description of what the tool does
+     *   Respond with: [{"tool":"name","args":{...}}]
+     */
     buildToolPrompt: () =>
       buildToolSystemPrompt(
         profileManager.getAllowedTools(toolEngine.getAllDefinitions()), // toolDefs = built-in + custom + userRegisteredTools found!

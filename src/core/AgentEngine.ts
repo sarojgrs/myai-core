@@ -575,7 +575,7 @@ export class AgentEngine {
   }
 
   /**
-   * nvalidate the context cache for a specific workspace+task,
+   * Invalidate the context cache for a specific workspace+task,
    * or clear all entries if called with no arguments.
    *
    * Call this after a tool that modifies the workspace (e.g. a large refactor)
